@@ -136,14 +136,3 @@ class IRaftActions(ABC):
             }
         """
         pass
-    
-    @abstractmethod
-    def apply_to_state_machine(self):
-        """
-        Apply all newly-committed entries to state machine
-        Called when commitIndex advances
-        
-        Executes commands from lastApplied+1 to commitIndex
-        Transitions: log entry → applied state
-        """
-        pass

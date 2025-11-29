@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Dict, List
-from raft_state import RaftState
+from raft.raft_state import RaftState
 
 @dataclass
 class RaftStructure:
@@ -21,6 +21,23 @@ class RaftStructure:
     state: RaftState
     last_log_index: int # Index of last log entry (0 if no log entries)
     last_log_term: int # Term of last log entry (0 if no log entries)
+    """
+    You append to the log file when a new entry arrives
+    This is just raw storage - the entry exists but hasn't been executed yet
+    File contains: term, index, command (as JSON strings)
+    """
     logs: List[Dict] = field(default_factory=list) # List of log entries, each entry is {term: int, command: any}
+    
+    """
+    An entry is committed when the majority has replicated it
+    Being committed means "this will never be lost, it's agreed upon"
+    But it still hasn't been executed!
+    """
     commit_index: int = 0 #Index of highest log entry known to be committed (initialized to 0)
+    """
+    An entry is applied when you actually run db.set_at() on the state machine
+    This is when the KV store actually gets updated
+    You can't apply until it's committed (safety requirement)
+    """
+    last_applied: int = 0
     election_timer: float = 0.5 #Election timeout value in seconds (randomized between 300-500ms)

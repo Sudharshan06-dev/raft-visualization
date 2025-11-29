@@ -1,15 +1,15 @@
 import rpyc
 from rpyc.utils.server import ThreadedServer
-from IRaftActions import IRaftActions
-from raft_structure import RaftStructure
-from raft_state import RaftState
+from raft.IRaftActions import IRaftActions
+from raft.raft_structure import RaftStructure
+from raft.raft_state import RaftState
 import random
 import concurrent.futures
 import datetime
 import json
 import threading
-from vote_arguments import VoteArguments
-from health_check_arguments import HealthCheckArguments
+from raft.vote_arguments import VoteArguments
+from raft.health_check_arguments import HealthCheckArguments
 
 
 class Raft(IRaftActions):
@@ -22,12 +22,15 @@ class Raft(IRaftActions):
     MIN_DELAY = 0.3 # 300ms is the minimum time to be added to the election timer
     MAX_DELAY = 0.5 # 500ms is the maximum time to be added to the election timer
 
-    def __init__(self, node_id, peers_config=None, logs_file_path="raft_logs.txt"):
+    def __init__(self, node_id, peers_config=None, logs_file_path="raft_logs.txt", state_machine_applier=None):
         # initialize raft structure with sensible defaults
         self._killed = False
         
         # ADDED: Thread safety lock for concurrent RPC access
         self.lock = threading.Lock()
+        
+        # ADDED: State machine applier (for applying committed log entries to KV store)
+        self.state_machine_applier = state_machine_applier
         
         self.raft_terms: RaftStructure = RaftStructure(
             id=node_id,
@@ -38,7 +41,9 @@ class Raft(IRaftActions):
             last_log_term=0,  # ADDED
             peers=peers_config if peers_config else {},
             state=RaftState.follower,
-            logs=[]  # ADDED
+            logs=[],  # ADDED
+            commit_index=0,  # ADDED: Highest log index committed
+            last_applied=0   # ADDED: Highest log index applied to state machine
         )
         
         # Load persistent state from disk if it exists - what if the server has crashed and it has restarted
@@ -105,7 +110,7 @@ class Raft(IRaftActions):
             # 3. Wait using event.wait(timeout)
             # it returns TRUE if set() was called -> if the health check function is reached before the timeout then the set is invoked
             # by another thread, or FALSE if the timeout was reached naturally.
-            health_status_invoked = self.election_timer_event.wait(timeout=self.raft_terms.election_timer)
+            election_timeout_invoked = self.election_timer_event.wait(timeout=self.raft_terms.election_timer)
             
             #Before asking for the vote check if the node is active
             #Checking the worst scenarios first
@@ -114,9 +119,15 @@ class Raft(IRaftActions):
             
             #Check if the leader invokes the health check up
             #If the events occurs then we have to again reset the timer for the election timeout
-            if health_status_invoked:
-                print(f"[Node {self.raft_terms.id}] Health check received, resetting timer")
+            if election_timeout_invoked:
+                print(f"[Node {self.raft_terms.id}] Election timeout received, resetting timer")
                 continue
+            
+             # ← ADD THIS CHECK: Don't start election if we're leader!
+            with self.lock:
+                if self.raft_terms.state == RaftState.leader:
+                    print(f"[Node {self.raft_terms.id}] Leader - skipping election")
+                    continue  # ← Skip election, just loop again
             
             # Election timeout fired -> start leader election
             print(f"[Node {self.raft_terms.id}] Election timeout! Starting election...")
@@ -148,8 +159,9 @@ class Raft(IRaftActions):
                     
                     return {
                         "success": False,
-                        "error": "not leader",
-                        "leader_id": None  # Client should redirect
+                        "error": "NOT_LEADER",
+                        "leader_hint": self._get_current_leader_id(),
+                        "message": f"Node {self.raft_terms.id} is not the leader"
                     }
                 
                 # Rule 2: Append to own log immediately
@@ -180,15 +192,19 @@ class Raft(IRaftActions):
                 }
                 
         except Exception as e:
-            print(f"[Node {self.raft_terms.id}] Error persisting state: {e}")
-            return -1
+            print(f"[Node {self.raft_terms.id}] Error appending log entry: {e}")
+            return {
+                "success": False,
+                "error": "INTERNAL_ERROR",
+                "message": str(e)
+            }
     
     def _persist_log_entry(self, log_entry):
         """Persist a single log entry to disk"""
         try:
             with open(self.raft_terms.logs_file_path, 'a') as f:
                 entry = {
-                    "timestamp": datetime.now().isoformat(),
+                    "timestamp": datetime.datetime.now().isoformat(),
                     "node_id": self.raft_terms.id,
                     "index": log_entry["index"],
                     "term": log_entry["term"],
@@ -196,404 +212,410 @@ class Raft(IRaftActions):
                 }
                 f.write(json.dumps(entry) + '\n')
         except Exception as e:
-            print(f"[Node {self.raft_terms.id}] Error persisting log: {e}")
+            print(f"[Node {self.raft_terms.id}] Error persisting log entry: {e}")
     
-    def get_committed_log_entry(self, index):
-        """
-        Read from state machine
-        Only return if entry is COMMITTED
-        Can be called by followers or clients
-        """
-    
-        with self.lock:
-            # Only return if committed
-            if index > self.raft_terms.commit_index:
-                return {
-                    "success": False,
-                    "error": "not committed yet",
-                    "committed_index": self.raft_terms.commit_index
-                }
-            
-            # Return committed entry
-            if index < len(self.raft_terms.logs):
-                return {
-                    "success": True,
-                    "entry": self.raft_terms.logs[index]
-                }
-            
-            return {
-                "success": False,
-                "error": "index out of range"
-            }
-
     def read_log(self, index):
+        
         """
-        Read-only query
+        PHASE 2: LOG REPLICATION - Client read request
         Raft Paper §5.3
-
-        Followers CAN serve reads if entry is committed
-        Leader can serve both committed AND uncommitted
+        
+        - Leaders can read from uncommitted logs (linearizable reads)
+        - Followers must read from committed logs only (for consistency)
+        
+        Returns:
+            dict: {
+                "success": bool,
+                "entry": dict (if found),
+                "committed": bool (if entry is committed),
+                "error": str (if not found)
+            }
         """
-    
+        
         with self.lock:
-            # Check if index exists
-            if index >= len(self.raft_terms.logs):
+            
+            # Check if index exists in logs
+            if index < 0 or index >= len(self.raft_terms.logs):
                 return {
                     "success": False,
-                    "error": "index not found"
+                    "error": "INDEX_OUT_OF_RANGE",
+                    "message": f"Index {index} not found in logs"
                 }
             
-            entry = self.raft_terms.logs[index]
+            log_entry = self.raft_terms.logs[index]
             is_committed = index <= self.raft_terms.commit_index
             
-            # FOLLOWERS: Can only serve committed reads
-            if self.raft_terms.state == RaftState.follower:
-                if not is_committed:
-                    return {
-                        "success": False,
-                        "error": "not committed yet, ask leader"
-                    }
+            # Follower rule: Only return committed entries
+            if self.raft_terms.state != RaftState.leader and not is_committed:
+                return {
+                    "success": False,
+                    "error": "NOT_COMMITTED",
+                    "message": f"Entry at index {index} is not yet committed"
+                }
             
-            # LEADER: Can serve committed and uncommitted
+            # Return the log entry
             return {
                 "success": True,
-                "entry": entry,
+                "entry": log_entry,
                 "committed": is_committed,
-                "commit_index": self.raft_terms.commit_index
+                "index": index
             }
-            
+    
+    def get_leader_info(self):
+        """Get current leader information for client routing."""
+        with self.lock:
+            return {
+                "node_id": self.raft_terms.id,
+                "state": self.raft_terms.state.name,
+                "term": self.raft_terms.current_term,
+                "leader_id": self._get_current_leader_id()
+            }
+    
+    def _get_current_leader_id(self):
+        """Get the current leader's ID (if known)."""
+        # In RAFT, followers don't explicitly track the leader
+        # But we can infer it from recent heartbeats
+        # For now, return None if we're not the leader
+        if self.raft_terms.state == RaftState.leader:
+            return self.raft_terms.id
+        return None
+    
     # -----------------------------
-    # Leader election (sender/receiver)
+    # Phase 1: Leader Election
     # -----------------------------
     
     def request_vote(self):
-        """
-        PHASE 1: LEADER ELECTION - Sender Implementation
-        Raft Paper §5.2: Candidates
         
-        On conversion to candidate:
-        - Increment currentTerm
-        - Vote for self
-        - Reset election timer
-        - Send RequestVote RPCs to all other servers
+        """
+        PHASE 1: LEADER ELECTION - RequestVote RPC sender
+        Raft Paper §5.2
+        
+        Executed when election timeout fires:
+        1. Increment currentTerm
+        2. Transition to CANDIDATE
+        3. Vote for self
+        4. Send RequestVote RPCs to all peers in PARALLEL
+        5. If majority votes: become LEADER
+        6. If discover higher term or another leader: become FOLLOWER
         """
         
         with self.lock:
-            # 1. Increase the current term and vote for self
+            # Step 1: Increment term
             self.raft_terms.current_term += 1
-            self.raft_terms.voted_for = self.raft_terms.id  # FIXED: Vote for self, not hardcoded 1
+            
+            # Step 2: Become candidate
             self.raft_terms.state = RaftState.candidate
+            
+            # Step 3: Vote for self
+            self.raft_terms.voted_for = self.raft_terms.id
+            self.vote_count = 1
+            self.received_votes = {self.raft_terms.id: True}
+            
+            print(f"[Node {self.raft_terms.id}] Starting election for term {self.raft_terms.current_term}")
+            
+            # Step 4: Persist state BEFORE sending RPCs
             self._persist_state()
             
-            print(f"[Node {self.raft_terms.id}] Became candidate for term {self.raft_terms.current_term}")
-            
-            #Construct the vote arguments
+            # Prepare RequestVote arguments
             vote_arguments = VoteArguments(
                 current_term=self.raft_terms.current_term,
                 candidate_id=self.raft_terms.id,
                 last_log_index=self.raft_terms.last_log_index,
                 last_log_term=self.raft_terms.last_log_term
             )
-        
-            #Vote for the node itself -> before sending out the RPC calls to the peers
-            self.vote_count += 1
-            self.received_votes = {self.raft_terms.id: True}  # Self voted
-             
-        #Store the reference of the thread / tasks to an array
-        vote_request_threads = []
+            
+            # Get peers snapshot
+            peers = dict(self.raft_terms.peers)
     
-        # 3. Send RequestVote RPCs to all other servers in parallel
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(self.raft_terms.peers.items())) as vote_request_executor:
-            for peer_id, peer_value in self.raft_terms.peers.items():
-                
+        # Step 5: Send RequestVote RPCs in PARALLEL
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(peers)) as executor:
+            futures = []
+            for peer_id, peer_value in peers.items():
                 if peer_id == self.raft_terms.id:
                     continue
                 
-                request_thread = vote_request_executor.submit(
-                    self._send_vote_request_to_peer,
-                    peer_id,
-                    peer_value,
-                    vote_arguments
-                )
-                
-                vote_request_threads.append(request_thread)
+                future = executor.submit(self._send_vote_request_to_peer, peer_id, peer_value, vote_arguments)
+                futures.append(future)
             
-             # Wait for all RPC threads to complete (2 second timeout)
-            concurrent.futures.wait(vote_request_threads, timeout=2.0)
+            concurrent.futures.wait(futures)
+    
+        # Step 6: Count votes AFTER all threads finish
+        won_election = False  # ← Flag
         
         with self.lock:
+            total_servers = len(self.raft_terms.peers) + 1
+            majority = (total_servers // 2) + 1
             
-            total_servers = len(self.raft_terms.peers.items())
-            majority_number = (total_servers // 2) + 1
+            print(f"[Node {self.raft_terms.id}] Election result: {self.vote_count}/{total_servers} votes (need {majority})")
             
-            if self.vote_count >= majority_number and self.raft_terms.state == RaftState.candidate:
+            # Step 7: Check if we won
+            if self.vote_count >= majority and self.raft_terms.state == RaftState.candidate:
+                print(f"[Node {self.raft_terms.id}] WON ELECTION for term {self.raft_terms.current_term}!")
+                
                 self.raft_terms.state = RaftState.leader
-                print(f"[Node {self.raft_terms.id}] ⭐ BECAME LEADER for term {self.raft_terms.current_term}")
                 self._persist_state()
-                self.send_health_checks()
-            else:
-                self.raft_terms.state = RaftState.follower
-                print(f"[Node {self.raft_terms.id}] Lost election (only {self.vote_count} votes)")
-                self.reset_election_timer()
-
-        
+                
+                # Initialize leader state
+                for peer_id in self.raft_terms.peers.keys():
+                    if peer_id != self.raft_terms.id:
+                        self.next_index[peer_id] = len(self.raft_terms.logs)
+                        self.match_index[peer_id] = 0
+                
+                won_election = True  # ← Set flag
     
-    def handle_request_vote(self, vote_args: VoteArguments) -> bool:
-        """
-        PHASE 1: LEADER ELECTION - Receiver Implementation
-        Raft Paper §5.1, §5.4 Receiver implementation for RequestVote RPC
+        # Step 8: Send immediate heartbeat OUTSIDE the lock
+        if won_election:
+            print(f"[Node {self.raft_terms.id}] Sending immediate heartbeat to establish leadership")
+            self.send_health_checks()
+    
+    def handle_request_vote(self, vote_arguments: VoteArguments):
         
-        1. Reply false if term < currentTerm
-        2. If votedFor is null or candidateId, and candidate's log is at 
-           least as up-to-date as receiver's log, grant vote
+        """
+        PHASE 1: LEADER ELECTION - RequestVote RPC receiver
+        Raft Paper §5.2, §5.4
+        
+        Called when another node requests our vote
+        Decision rules:
+        1. Reject if candidate's term < currentTerm
+        2. If candidate's term > currentTerm: update term, become follower
+        3. Grant vote if:
+            - Haven't voted in this term OR already voted for this candidate
+            - Candidate's log is at least as up-to-date as receiver's log
         """
         
         with self.lock:
-            print(f"[Node {self.raft_terms.id}] Received RequestVote from candidate {vote_args.candidate_id} for term {vote_args.current_term}")
             
-            '''
-            CHECK FOR THE FAILING CONDITIONS FIRST
-            '''
+            print(f"[Node {self.raft_terms.id}] Received RequestVote from Node {vote_arguments.candidate_id} (term {vote_arguments.current_term})")
             
-            # Rule 1: Reply false if term < currentTerm
-            if vote_args.current_term < self.raft_terms.current_term:
-                print(f"[Node {self.raft_terms.id}] Rejecting vote: candidate term {vote_args.current_term} < current term {self.raft_terms.current_term}")
-                return False
-        
-            # Rule 2: If votedFor is null (-1), check log recency
-            if self.raft_terms.voted_for == -1 and self.raft_terms.last_log_index > vote_args.last_log_index:
-                print(f"[Node {self.raft_terms.id}] Rejecting vote: candidate log not up-to-date")
+            # Rule 1: Reject stale term
+            if vote_arguments.current_term < self.raft_terms.current_term:
+                print(f"[Node {self.raft_terms.id}] Rejected (stale term)")
                 return False
             
-            '''
-            NOW IF ALL THE RULES ARE PASSED WE VOTE FOR THE CANDIDATE AND UPDATE OUR STATE
-            '''
-            print(f"[Node {self.raft_terms.id}] Received higher term {vote_args.current_term}, updating from {self.raft_terms.current_term}")
-            self.raft_terms.current_term = vote_args.current_term
-            self.raft_terms.voted_for = vote_args.candidate_id
-            self.raft_terms.state = RaftState.follower
-            persist_state = self._persist_state()
+            # Rule 2: If RPC term > currentTerm: update term and become follower
+            if vote_arguments.current_term > self.raft_terms.current_term:
+                print(f"[Node {self.raft_terms.id}] Higher term detected, updating to {vote_arguments.current_term}")
+                self.raft_terms.current_term = vote_arguments.current_term
+                self.raft_terms.state = RaftState.follower
+                self.raft_terms.voted_for = -1  # Clear vote in new term
             
-            #After the state is persisted -> reset the voted for variable -> read for the next election
-            if persist_state:
-                self.raft_terms.voted_for = -1
-            
-            # Rule 2: Reply false if term < currentTerm
-            if vote_args.current_term < self.raft_terms.current_term:
-                print(f"[Node {self.raft_terms.id}] Rejecting vote: candidate term {vote_args.current_term} < current term {self.raft_terms.current_term}")
-                return False
-            
-            # Rule 3: If votedFor is null (-1) or candidateId, check log recency
-            if self.raft_terms.voted_for == -1 or self.raft_terms.voted_for == vote_args.candidate_id:
-                # Check if candidate's log is at least as up-to-date as receiver's log
-                candidate_log_ok = self._is_log_up_to_date(
-                    vote_args.last_log_term, 
-                    vote_args.last_log_index
-                )
-                
-                if candidate_log_ok:
-                    # Grant vote and persist before responding
-                    self.raft_terms.voted_for = vote_args.candidate_id
-                    self._persist_state()
-                    # Reset election timer when vote is granted (§5.2)
-                    self.reset_election_timer()
-                    print(f"[Node {self.raft_terms.id}] ✓ Granted vote to candidate {vote_args.candidate_id}")
-                    return True
-                else:
-                    print(f"[Node {self.raft_terms.id}] Rejecting vote: candidate log not up-to-date")
-                    return False
-            
-            print(f"[Node {self.raft_terms.id}] Rejecting vote: already voted for {self.raft_terms.voted_for}")
-            return False
-
-    def _send_vote_request_to_peer(self, peer_id, peer_value, vote_arguments):
-        """Send RequestVote RPC to a peer (NO CALLBACK)"""
-        conn = None
-        try:
-            print(f"[Node {self.raft_terms.id}] Sending RequestVote to Node {peer_id}")
-            
-            conn = rpyc.connect(
-                peer_value["host"],
-                peer_value["port"],
-                config={"allow_public_attrs": True}
+            # Rule 3: Check if we can grant vote
+            can_vote = (
+                self.raft_terms.voted_for == -1 or 
+                self.raft_terms.voted_for == vote_arguments.candidate_id
             )
-            result = conn.root.exposed_send_vote_request(vote_arguments)
             
-            print(f"[Node {self.raft_terms.id}] RPC to Node {peer_id}: {result}")
+            # Rule 4: Check if candidate's log is up-to-date (§5.4.1)
+            log_is_current = self._is_log_up_to_date(
+                vote_arguments.last_log_term,
+                vote_arguments.last_log_index
+            )
             
-            # Update vote count if granted
-            if result:
-                with self.lock:
-                    self.vote_count += 1
-                    self.received_votes[peer_id] = True
+            # Grant vote if both conditions met
+            if can_vote and log_is_current:
+                self.raft_terms.voted_for = vote_arguments.candidate_id
+                self._persist_state()  # Persist vote before responding
+                self.reset_election_timer()  # Reset our own election timeout
+                print(f"[Node {self.raft_terms.id}] GRANTED vote to Node {vote_arguments.candidate_id}")
+                return True
+            else:
+                print(f"[Node {self.raft_terms.id}] REJECTED vote (can_vote={can_vote}, log_current={log_is_current})")
+                return False
+    
+    # -----------------------------
+    # Phase 2: Log Replication
+    # -----------------------------
+    
+    def _heartbeat_ticker(self):
         
-        except Exception as e:
-            print(f"[Node {self.raft_terms.id}] RPC to Node {peer_id} failed: {e}")
-        finally:
-            if conn:
-                try:
-                    conn.close()
-                except:
-                    pass
-
-    # -----------------------------
-    # Heartbeat / Log replication
-    # -----------------------------
-    
-    
-    def _hearbeat_ticker(self):
+        print(f"[Node {self.raft_terms.id}] Heartbeat ticker thread STARTED")  # ← Add this
+        
         """
-        Daemon thread that sends periodic heartbeats (AppendEntries RPC)
-        Only runs if node is leader
-        Raft Paper §5.3: Leader sends heartbeats at least every 150ms
+        PHASE 2: LOG REPLICATION - Heartbeat loop (leader only)
+        Raft Paper §5.2
+        
+        Leader sends periodic heartbeats (AppendEntries with no entries)
+        to maintain authority and prevent elections
+        
+        Frequency: 100ms (much less than election timeout of 300-500ms)
         """
         
         while not self.killed():
             
-            # Only send heartbeats if leader
-            if self.raft_terms.state == RaftState.leader:
+            # Only leader sends heartbeats
+            with self.lock:
+                is_leader = (self.raft_terms.state == RaftState.leader)
+            
+            if is_leader:
+                print(f"[Node {self.raft_terms.id}] Sending heartbeats...") 
                 self.send_health_checks()
             
-            self.heartbeat_timer_event.wait(timeout=0.1)
-            self.heartbeat_timer_event.clear()
+            # Wait 100ms before next heartbeat
+            # This is MUCH shorter than election timeout (300-500ms)
+            # to prevent followers from timing out
+            self.heartbeat_timer_event.wait(timeout=0.2)  # 100ms
     
     def send_health_checks(self):
         
         """
-        PHASE 2: LOG REPLICATION - Heartbeat
-        Raft Paper §5.3: Leader sends AppendEntries RPC to all followers
+        PHASE 2: LOG REPLICATION - AppendEntries RPC sender
+        Raft Paper §5.3
         
-        Contains log entries (or empty for heartbeat)
-        Used to:
-        1. Replicate logs to followers
-        2. Detect down followers (timeout)
-        3. Keep followers from starting elections (heartbeat resets timer)
+        Leader sends AppendEntries RPCs to all followers:
+        - If no new entries: heartbeat (prevents election)
+        - If new entries: replication (with consistency check)
+        
+        For each follower:
+        1. Prepare entries starting from nextIndex[follower]
+        2. Include prevLogIndex/prevLogTerm for consistency check
+        3. Send RPC in parallel
+        4. On success: update matchIndex, try to advance commitIndex
+        5. On failure: decrement nextIndex and retry
         """
-        
-        if self.raft_terms.state != RaftState.leader:
-            return
-        
         with self.lock:
-                            
-                for peer_id, peer_value in self.raft_terms.peers.items():
-                    
-                    if peer_id == self.raft_terms.id:
-                        continue
-                    
-                    prev_log_index = self.next_index[peer_id] - 1
-                    prev_log_term = 0
-                    
-                    if prev_log_index >= 0 and prev_log_index < len(self.raft_terms.logs):
-                        prev_log_term = self.raft_terms.logs[prev_log_index].get("term", 0)
-                    
-                    entries_to_send = self.raft_terms.logs[self.next_index[peer_id]:]
-                    
-                    health_checks_args = HealthCheckArguments(
-                        current_term=self.raft_terms.current_term,
-                        leader_id=self.raft_terms.id,
-                        prev_log_index=prev_log_index,
-                        prev_log_term=prev_log_term,
-                        entries=entries_to_send,
-                        leader_commit=self.raft_terms.commit_index
-                    )
-                    
-                rpc_thread = threading.Thread(
-                    target=self._send_health_checks_to_peer,
-                    args=(peer_id, peer_value, health_checks_args),
-                    daemon=True
-                )
-                            
-                rpc_thread.start()
-
+            
+            # Only leader sends AppendEntries
+            if self.raft_terms.state != RaftState.leader:
+                return
+            
+            print(f"SEND HELATH CHECK TO PEERS ARRIVED {self.raft_terms.state}")
+            
+            peers = dict(self.raft_terms.peers)
+        
+        # Send to all peers IN PARALLEL
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(peers)) as executor:
+            for peer_id, peer_value in peers.items():
+                if peer_id == self.raft_terms.id:
+                    continue
+                
+                # Submit heartbeat task
+                executor.submit(self._send_health_check_to_peer, peer_id, peer_value)
     
     def handle_health_check_request(self, health_check_arguments: HealthCheckArguments):
         
         """
-        PHASE 2: LOG REPLICATION - Receiver Implementation
-        Raft Paper §5.3: Receiver implementation for AppendEntries RPC
+        PHASE 2: LOG REPLICATION - AppendEntries RPC receiver
+        Raft Paper §5.3
         
-        1. Reply false if term < currentTerm
-        2. Reply false if log doesn't contain entry at prevLogIndex with term = prevLogTerm
-        3. If an existing entry conflicts, delete it and all following entries
-        4. Append new entries not already in log
-        5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, last index)
+        Called when leader (or candidate) sends AppendEntries
+        
+        Consistency check:
+        1. Reject if term < currentTerm
+        2. If term >= currentTerm: reset election timer, become follower
+        3. Check if log contains entry at prevLogIndex with prevLogTerm
+        4. If match: append new entries, update commitIndex
+        5. If no match: return failure (leader will decrement nextIndex)
         """
+        
         with self.lock:
-            # Rule 1: If higher term, become follower
-            if health_check_arguments.current_term > self.raft_terms.current_term:
-                self.raft_terms.state = RaftState.follower
-                self.raft_terms.voted_for = -1
-                self.raft_terms.current_term = health_check_arguments.current_term
-                self._persist_state()
             
-            # Rule 2: Reply false if term < currentTerm
+            print(f"[Node {self.raft_terms.id}] Received AppendEntries from Node {health_check_arguments.leader_id} (term {health_check_arguments.current_term})")
+            
+            # Rule 1: Reject stale term
             if health_check_arguments.current_term < self.raft_terms.current_term:
                 return {"success": False, "term": self.raft_terms.current_term}
             
-            # Reset election timer (heartbeat received)
-            self.reset_election_timer()
+            # Rule 2: Valid leader discovered -> reset timer and become follower
+            if health_check_arguments.current_term >= self.raft_terms.current_term:
+                self.raft_terms.current_term = health_check_arguments.current_term
+                self.raft_terms.state = RaftState.follower
+                self.reset_election_timer()
             
-            # Rule 3: Check log match at prevLogIndex
+            # Rule 3: Log consistency check
+            # Check if we have an entry at prevLogIndex matching prevLogTerm
             if health_check_arguments.prev_log_index >= 0:
-                
-                # If we don't have this index, reject
+                # prevLogIndex is -1 for first entry
                 if health_check_arguments.prev_log_index >= len(self.raft_terms.logs):
-                    print(f"[Node {self.raft_terms.id}] Log mismatch: missing index {health_check_arguments.prev_log_index}")
+                    # We're missing entries
+                    print(f"[Node {self.raft_terms.id}] Log too short (have {len(self.raft_terms.logs)}, need {health_check_arguments.prev_log_index + 1})")
                     return {"success": False, "term": self.raft_terms.current_term}
-            
-                # Check if term matches
-                if self.raft_terms.logs[health_check_arguments.prev_log_index].get("term", 0) != health_check_arguments.current_term:
-                    print(f"[Node {self.raft_terms.id}] Log mismatch: term mismatch at index {health_check_arguments.prev_log_index}")
-                    
-                    # Delete conflicting entry and all following -> Get from the start till the previous index of the mismatched term
+                
+                # Check term match
+                prev_entry = self.raft_terms.logs[health_check_arguments.prev_log_index]
+                if prev_entry["term"] != health_check_arguments.prev_log_term:
+                    # Term mismatch -> delete conflicting entry and all that follow
+                    print(f"[Node {self.raft_terms.id}] Log conflict at index {health_check_arguments.prev_log_index}")
                     self.raft_terms.logs = self.raft_terms.logs[:health_check_arguments.prev_log_index]
                     return {"success": False, "term": self.raft_terms.current_term}
             
-            # Rule 4: Append new entries
-            if len(health_check_arguments.entries) > 0:
+            # Rule 4: Append new entries (if any)
+            if health_check_arguments.entries:
+                # Delete any conflicting entries and append new ones
+                insert_index = health_check_arguments.prev_log_index + 1
+                self.raft_terms.logs = self.raft_terms.logs[:insert_index]
+                self.raft_terms.logs.extend(health_check_arguments.entries)
                 
-                self.raft_terms.logs = self.raft_terms.logs[:health_check_arguments.prev_log_index + 1]
+                # Update metadata
+                if self.raft_terms.logs:
+                    self.raft_terms.last_log_index = len(self.raft_terms.logs) - 1
+                    self.raft_terms.last_log_term = self.raft_terms.logs[-1]["term"]
                 
-                #Append new entries
-                for entry in health_check_arguments.entries:
-                    self.raft_terms.logs.append(entry)
-                
-                #Update last_log_index and log_term
-                self.raft_terms.last_log_index = len(self.raft_terms.logs) - 1
-                self.raft_terms.last_log_term = self.raft_terms.logs[-1].get("term", 0)
-                
-                print(f"[Node {self.raft_terms.id}] Appended {len(health_check_arguments.entries)} entries, now at index {self.raft_terms.last_log_index}")
+                print(f"[Node {self.raft_terms.id}] Appended {len(health_check_arguments.entries)} entries")
             
-            #Rule 5: Advance commit index
+            # Rule 5: Update commitIndex
             if health_check_arguments.leader_commit > self.raft_terms.commit_index:
                 old_commit = self.raft_terms.commit_index
-                self.raft_terms.commit_index = min(health_check_arguments.leader_commit, len(self.raft_terms.logs - 1)) #len(self.raft_terms.logs - 1) this will be updated since we have done the append entries on rule 4
-                print(f"[Node {self.raft_terms.id}] Advanced commitIndex from {old_commit} to {self.raft_terms.commit_index}")
-                # TODO: Apply committed entries to state machine
+                self.raft_terms.commit_index = min(
+                    health_check_arguments.leader_commit,
+                    len(self.raft_terms.logs) - 1
+                )
+                print(f"[Node {self.raft_terms.id}] Updated commitIndex: {old_commit} -> {self.raft_terms.commit_index}")
+                
+                # Apply newly committed entries to state machine
+                self._apply_committed_entries()
             
             return {"success": True, "term": self.raft_terms.current_term}
-        
-    '''
-    HELPER FUNCTION FOR LEADER ELECTION
-    '''
-    def _send_health_checks_to_peer(self, peer_id: int, peer_value: str, health_check_args: HealthCheckArguments):
-        
+    
+    def _apply_committed_entries(self):
         """
-        Send AppendEntries RPC to a peer
-        Raft Paper §5.3: Receiver implementation
-        
-        If follower rejects (log doesn't match):
-        - Decrement nextIndex[peer]
-        - Retry with earlier log entries
-        
-        If follower accepts:
-        - Update matchIndex[peer] and nextIndex[peer]
+        Apply all committed but not yet applied log entries to state machine.
+        Called when commitIndex > lastApplied
         """
-        
+        while self.raft_terms.last_applied < self.raft_terms.commit_index:
+            self.raft_terms.last_applied += 1
+            log_entry = self.raft_terms.logs[self.raft_terms.last_applied]
+            
+            print(f"[Node {self.raft_terms.id}] Applying log entry {self.raft_terms.last_applied} to state machine")
+            
+            # Apply to state machine using the applier
+            if self.state_machine_applier:
+                try:
+                    result = self.state_machine_applier.apply(log_entry["command"])
+                    print(f"[Node {self.raft_terms.id}] State machine apply result: {result}")
+                except Exception as e:
+                    print(f"[Node {self.raft_terms.id}] Error applying to state machine: {e}")
+    
+    def _send_health_check_to_peer(self, peer_id, peer_value):
+        """Send AppendEntries RPC to a single peer (NO CALLBACK)"""
         conn = None
-        
         try:
+            
+            print(f"HEALTH CHECK IS CALLED {peer_id}")
+            
+            with self.lock:
+                # Prepare entries to send (from nextIndex[peer] onwards)
+                next_idx = self.next_index[peer_id]
+                prev_log_index = next_idx - 1
+                prev_log_term = 0
+                
+                if prev_log_index >= 0 and prev_log_index < len(self.raft_terms.logs):
+                    prev_log_term = self.raft_terms.logs[prev_log_index]["term"]
+                
+                # Get entries from nextIndex onwards (empty list for heartbeat)
+                entries = []
+                if next_idx < len(self.raft_terms.logs):
+                    entries = self.raft_terms.logs[next_idx:]
+                
+                # Prepare RPC arguments
+                health_check_args = HealthCheckArguments(
+                    current_term=self.raft_terms.current_term,
+                    leader_id=self.raft_terms.id,
+                    prev_log_index=prev_log_index,
+                    prev_log_term=prev_log_term,
+                    entries=entries,
+                    leader_commit=self.raft_terms.commit_index
+                )
+            
             print(f"[Node {self.raft_terms.id}] Sending health checks to Node {peer_id}")
             
             conn = rpyc.connect(
@@ -611,14 +633,14 @@ class Raft(IRaftActions):
                 if result is None:
                     return
 
-                if result.get("term", 0) > self.raft_terms.current_term:
+                if result['term'] > self.raft_terms.current_term:
                     self.raft_terms.current_term = result["term"]
                     self.raft_terms.state = RaftState.follower
                     self.raft_terms.voted_for = -1
                     return 
 
                 # If success=False: follower's log doesn't match
-                if not result.get("success", False):
+                if not result['success']:
                     # Decrement nextIndex[peer] and retry next time
                     if self.next_index[peer_id] > 0:
                         self.next_index[peer_id] -= 1
@@ -657,14 +679,14 @@ class Raft(IRaftActions):
         Raft Paper §5.3
         """
         
-        if self.raft_terms.state == RaftState.leader:
+        if self.raft_terms.state != RaftState.leader:
             return
 
         # Count how many servers have replicated each log index
-        
+        # Start from the end of the log and work backwards
         for index in range(len(self.raft_terms.logs) - 1, self.raft_terms.commit_index, -1):
             
-            replicated_count = 1 #To count in self
+            replicated_count = 1 # Count self
             
             for peer_id in self.raft_terms.peers.keys():
                 if peer_id == self.raft_terms.id:
@@ -676,10 +698,14 @@ class Raft(IRaftActions):
             total_servers = len(self.raft_terms.peers)
             majority = (total_servers // 2) + 1
             
+            # Only commit entries from current term (§5.4.2)
             if replicated_count >= majority and self.raft_terms.logs[index].get("term") == self.raft_terms.current_term:
+                old_commit = self.raft_terms.commit_index
                 self.raft_terms.commit_index = index
-                print(f"[Node {self.raft_terms.id}] Advanced commitIndex to {index}")
-                # TODO: Apply committed entries to state machine
+                print(f"[Node {self.raft_terms.id}] Advanced commitIndex: {old_commit} -> {index}")
+                
+                # Apply newly committed entries
+                self._apply_committed_entries()
                 break
             
             
@@ -740,22 +766,19 @@ class Raft(IRaftActions):
         try:
             with open(self.raft_terms.logs_file_path, 'a') as source_file:
                 state_entry = {
-                    "timestamp": datetime.now().isoformat(),
+                    "timestamp": datetime.datetime.now().isoformat(),
                     "node_id": self.raft_terms.id,
                     "current_term": self.raft_terms.current_term,
+                    "voted_for": self.raft_terms.voted_for,
                     "state": self.raft_terms.state.name
                 }
                 source_file.write(json.dumps(state_entry) + '\n')
         
         except Exception as e:
             print(f"[Node {self.raft_terms.id}] Error persisting state: {e}")
-            return -1
     
     def _load_persistent_state(self):
         """
-        Docstring for _load_persistent_state
-        
-        :param self: Description
         Load persistent state (current_term, voted_for) when the server is boot up / restarted
         Reads the last entry from the logs to recover the state
         """

@@ -1,6 +1,8 @@
 import rpyc
 from rpyc.utils.server import ThreadedServer
-from raft_server import Raft
+from raft.raft_server import Raft
+from inmem.byte_data_db import ByteDataDB
+from inmem.state_machine_applier import StateMachineApplier
 
 class RaftService(rpyc.Service):
     """
@@ -14,6 +16,7 @@ class RaftService(rpyc.Service):
         super().__init__()
         # Will be set from run_server()
         self._raft = None
+        self._db = None
     
     # ==================== PHASE 1: LEADER ELECTION ====================
     
@@ -96,42 +99,59 @@ class RaftService(rpyc.Service):
         """
         return self._raft.read_log(index)
 
+    # ==================== LEADER DISCOVERY ====================
+    
+    def exposed_get_leader(self):
+        """Get current leader info for client routing."""
+        return self._raft.get_leader_info()
+    
+    # ==================== KV STORE READS (DIRECT FROM STATE MACHINE) ====================
+    
+    def exposed_read_kv(self, key: str, field: str, timestamp: int):
+        """Read from committed state machine."""
+        value = self._db.get_at(key, field, timestamp)
+        if value is not None:
+            return {"success": True, "value": value}
+        return {"success": False, "error": "NOT_FOUND"}
+    
+    def exposed_scan_kv(self, key: str, timestamp: int):
+        """Scan all fields for a key."""
+        record = self._db.get_record(key)
+        if not record:
+            return {"success": True, "fields": []}
+        return {"success": True, "fields": record.scan_fields(timestamp)}
+    
+    def exposed_scan_kv_by_prefix(self, key: str, prefix: str, timestamp: int):
+        """Scan fields by prefix."""
+        record = self._db.get_record(key)
+        if not record:
+            return {"success": True, "fields": []}
+        return {"success": True, "fields": record.scan_fields_by_prefix(prefix, timestamp)}
+
 
 def run_server(host="127.0.0.1", port=5001, node_id=0, peers_config=None):
-    """
-    Start the RPyC server for a RAFT node
     
-    Args:
-        host: Hostname to listen on (default: localhost)
-        port: Port to listen on (default: 5001)
-        node_id: Unique ID for this node (default: 0)
-        peers_config: Dict mapping peer_id to {host, port}
-                     Example: {1: {"host": "127.0.0.1", "port": 5002}, ...}
+    # Create shared ByteDataDB instance for this node
+    db = ByteDataDB.get_instance()
     
-    Example:
-        peers = {
-            1: {"host": "127.0.0.1", "port": 5001},
-            2: {"host": "127.0.0.1", "port": 5002},
-            3: {"host": "127.0.0.1", "port": 5003},
-        }
-        run_server(host="127.0.0.1", port=5001, node_id=0, peers_config=peers)
-    """
+    # Create state machine applier
+    applier = StateMachineApplier(db)
     
-    # Create RAFT node
+    # Create RAFT node with the applier
     raft_node = Raft(
         node_id=node_id,
         peers_config=peers_config if peers_config else {},
-        logs_file_path=f"raft_node_{node_id}.log"
+        logs_file_path=f"raft_node_{node_id}.log",
+        state_machine_applier=applier  # <-- Pass applier to RAFT
     )
     
-    # Create RPC service
+    # Create RPC service with both RAFT and DB
     service = RaftService()
     service._raft = raft_node
+    service._db = db  # <-- For direct reads
     
-    # Start election timer thread
+    # Start RAFT threads
     raft_node.start_raft_node()
-    
-    # Start heartbeat timer thread (for leaders)
     raft_node.heartbeat_thread.start()
     
     # Start RPC server
@@ -139,11 +159,10 @@ def run_server(host="127.0.0.1", port=5001, node_id=0, peers_config=None):
         service,
         hostname=host,
         port=port,
-        nbThreads=100  # Support up to 100 concurrent RPC calls
+        protocol_config={"allow_public_attrs": True}
     )
     
-    print(f"[Node {node_id}] RPyC Server listening on {host}:{port}")
-    print(f"[Node {node_id}] Peers: {peers_config if peers_config else 'None'}")
+    print(f"[Node {node_id}] Server on {host}:{port}")
     
     try:
         server.start()
@@ -154,8 +173,4 @@ def run_server(host="127.0.0.1", port=5001, node_id=0, peers_config=None):
 
 
 if __name__ == "__main__":
-    # Single node startup for testing
-    try:
-        run_server(host="127.0.0.1", port=5001, node_id=0)
-    except KeyboardInterrupt:
-        print("Server shutting down")
+    run_server(host="127.0.0.1", port=5001, node_id=0)
