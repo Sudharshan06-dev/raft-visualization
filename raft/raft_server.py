@@ -10,6 +10,7 @@ import json
 import threading
 from raft.vote_arguments import VoteArguments
 from raft.health_check_arguments import HealthCheckArguments
+from rpyc.utils.classic import obtain #To change the netref to dict
 
 
 class Raft(IRaftActions):
@@ -22,7 +23,7 @@ class Raft(IRaftActions):
     MIN_DELAY = 0.3 # 300ms is the minimum time to be added to the election timer
     MAX_DELAY = 0.5 # 500ms is the maximum time to be added to the election timer
 
-    def __init__(self, node_id, peers_config=None, logs_file_path="raft_logs.txt", state_machine_applier=None):
+    def __init__(self, node_id, peers_config=None, logs_file_path="raft_logs.jsonl", state_machine_applier=None):
         # initialize raft structure with sensible defaults
         self._killed = False
         
@@ -55,13 +56,12 @@ class Raft(IRaftActions):
     
         # Initialize for all peers
         for peer_id in (peers_config if peers_config else {}).keys():
-            self.next_index[peer_id] = len(self.raft_terms.logs)  # Start at my last log index
-            self.match_index[peer_id] = 0
+            self.next_index[peer_id] = 0  # Start at my last log index
+            self.match_index[peer_id] = -1
     
         # ADDED: Heartbeat timer thread
         self.heartbeat_timer_event = threading.Event()
         self.heartbeat_thread = threading.Thread(target=self._heartbeat_ticker, daemon=True)
-        
         self.election_timer_event = threading.Event()
         self.timer_thread = threading.Thread(target=self._ticker, args=(), daemon=True)
         
@@ -102,7 +102,7 @@ class Raft(IRaftActions):
             
             # 2. Randomize the timeout duration for the next cycle
             # We must do this before we start waiting
-            new_timeout_ms = random.uniform(300, 500)
+            new_timeout_ms = random.uniform(5000, 10000)
             self.raft_terms.election_timer = new_timeout_ms / 1000.0 # To yield the new timeout in ms and not in seconds
             
             print(f"[Node {self.raft_terms.id}] Ticker waiting for up to {self.raft_terms.election_timer:.3f}s...")
@@ -167,18 +167,19 @@ class Raft(IRaftActions):
                 # Rule 2: Append to own log immediately
                 log_entry = {
                     "term": self.raft_terms.current_term,
-                    "command": command,
-                    "index": len(self.raft_terms.logs)
+                    "command": str(command) if not isinstance(command, str) else command
                 }
-                
+
                 self.raft_terms.logs.append(log_entry)
+                log_index = len(self.raft_terms.logs) - 1  # Calculate index from position
                 self.raft_terms.last_log_index = len(self.raft_terms.logs) - 1
                 self.raft_terms.last_log_term = self.raft_terms.current_term
+                self.next_index[self.raft_terms.id] = len(self.raft_terms.logs)
             
                 # Rule 3: Persist to disk immediately (required by Raft)
                 self._persist_log_entry(log_entry)
                 
-                print(f"[Node {self.raft_terms.id}] Appended log entry at index {log_entry['index']}")
+                print(f"[Node {self.raft_terms.id}] Appended log entry at index {log_index}")
 
                 # Rule 4: Return to client
                 # Client can:
@@ -186,7 +187,7 @@ class Raft(IRaftActions):
                 # - Or just wait (entries will be replicated in background)
                 return {
                     "success": True,
-                    "index": log_entry["index"],
+                    "index": log_index,
                     "term": self.raft_terms.current_term,
                     "message": "Appended to leader log, waiting for replication"
                 }
@@ -200,20 +201,23 @@ class Raft(IRaftActions):
             }
     
     def _persist_log_entry(self, log_entry):
-        """Persist a single log entry to disk"""
+        """Persist a single log entry to the LOG file (append-only)"""
         try:
+            # Calculate index from current log length
+            log_index = len(self.raft_terms.logs) - 1
+            
+            # Write to SEPARATE log file
             with open(self.raft_terms.logs_file_path, 'a') as f:
                 entry = {
-                    "timestamp": datetime.datetime.now().isoformat(),
-                    "node_id": self.raft_terms.id,
-                    "index": log_entry["index"],
+                    "index": log_index,
                     "term": log_entry["term"],
                     "command": log_entry["command"]
                 }
-                f.write(json.dumps(entry) + '\n')
+                f.write(json.dumps(entry) + '\n')  # Add newline for readability
+                
         except Exception as e:
             print(f"[Node {self.raft_terms.id}] Error persisting log entry: {e}")
-    
+        
     def read_log(self, index):
         
         """
@@ -359,7 +363,7 @@ class Raft(IRaftActions):
                 for peer_id in self.raft_terms.peers.keys():
                     if peer_id != self.raft_terms.id:
                         self.next_index[peer_id] = len(self.raft_terms.logs)
-                        self.match_index[peer_id] = 0
+                        self.match_index[peer_id] = -1
                 
                 won_election = True  # ← Set flag
     
@@ -453,7 +457,7 @@ class Raft(IRaftActions):
             # Wait 100ms before next heartbeat
             # This is MUCH shorter than election timeout (300-500ms)
             # to prevent followers from timing out
-            self.heartbeat_timer_event.wait(timeout=0.2)  # 100ms
+            self.heartbeat_timer_event.wait(timeout=4.5)  # 100ms
     
     def send_health_checks(self):
         
@@ -519,6 +523,7 @@ class Raft(IRaftActions):
             if health_check_arguments.current_term >= self.raft_terms.current_term:
                 self.raft_terms.current_term = health_check_arguments.current_term
                 self.raft_terms.state = RaftState.follower
+                self._persist_state()
                 self.reset_election_timer()
             
             # Rule 3: Log consistency check
@@ -530,20 +535,38 @@ class Raft(IRaftActions):
                     print(f"[Node {self.raft_terms.id}] Log too short (have {len(self.raft_terms.logs)}, need {health_check_arguments.prev_log_index + 1})")
                     return {"success": False, "term": self.raft_terms.current_term}
                 
-                # Check term match
-                prev_entry = self.raft_terms.logs[health_check_arguments.prev_log_index]
-                if prev_entry["term"] != health_check_arguments.prev_log_term:
+                prev_entry_local = obtain(self.raft_terms.logs[health_check_arguments.prev_log_index])
+                prev_term = int(prev_entry_local["term"])
+                
+                if prev_term != health_check_arguments.prev_log_term:
                     # Term mismatch -> delete conflicting entry and all that follow
                     print(f"[Node {self.raft_terms.id}] Log conflict at index {health_check_arguments.prev_log_index}")
                     self.raft_terms.logs = self.raft_terms.logs[:health_check_arguments.prev_log_index]
+                    self._truncate_log_file(health_check_arguments.prev_log_index)
                     return {"success": False, "term": self.raft_terms.current_term}
             
             # Rule 4: Append new entries (if any)
+            print(f'CHECKING HERE BEFORE RULE 4', health_check_arguments.entries)
             if health_check_arguments.entries:
                 # Delete any conflicting entries and append new ones
                 insert_index = health_check_arguments.prev_log_index + 1
                 self.raft_terms.logs = self.raft_terms.logs[:insert_index]
-                self.raft_terms.logs.extend(health_check_arguments.entries)
+                self._truncate_log_file(insert_index)  
+                
+                for entry_ref in health_check_arguments.entries:
+                    if isinstance(entry_ref, dict):
+                        plain_entry = entry_ref
+                    else:
+                        plain_entry = obtain(entry_ref)
+            
+                    clean_entry = {
+                        "term": int(plain_entry["term"]),
+                        "command": str(plain_entry["command"])
+                    }
+                    self.raft_terms.logs.append(clean_entry)
+                    
+                    #Persist to disk immediately (RAFT requirement)
+                    self._persist_log_entry(clean_entry)
                 
                 # Update metadata
                 if self.raft_terms.logs:
@@ -559,8 +582,8 @@ class Raft(IRaftActions):
                     health_check_arguments.leader_commit,
                     len(self.raft_terms.logs) - 1
                 )
+                self._persist_state()
                 print(f"[Node {self.raft_terms.id}] Updated commitIndex: {old_commit} -> {self.raft_terms.commit_index}")
-                
                 # Apply newly committed entries to state machine
                 self._apply_committed_entries()
             
@@ -599,12 +622,13 @@ class Raft(IRaftActions):
                 prev_log_term = 0
                 
                 if prev_log_index >= 0 and prev_log_index < len(self.raft_terms.logs):
-                    prev_log_term = self.raft_terms.logs[prev_log_index]["term"]
+                    prev_entry = self.raft_terms.logs[prev_log_index]
+                    prev_log_term = int(prev_entry["term"])
                 
                 # Get entries from nextIndex onwards (empty list for heartbeat)
                 entries = []
                 if next_idx < len(self.raft_terms.logs):
-                    entries = self.raft_terms.logs[next_idx:]
+                    entries = [self.raft_terms.logs[next_idx]]
                 
                 # Prepare RPC arguments
                 health_check_args = HealthCheckArguments(
@@ -616,7 +640,7 @@ class Raft(IRaftActions):
                     leader_commit=self.raft_terms.commit_index
                 )
             
-            print(f"[Node {self.raft_terms.id}] Sending health checks to Node {peer_id}")
+            print(f"[Node {self.raft_terms.id}] Sending health checks to Node {peer_id} {health_check_args}")
             
             conn = rpyc.connect(
                 peer_value["host"],
@@ -650,15 +674,22 @@ class Raft(IRaftActions):
 
                 #If success=True: follower accepted the entries
                 # Update matchIndex and nextIndex for this peer
-                new_match_index = health_check_args.prev_log_index + len(health_check_args.entries)
-                self.match_index[peer_id] = new_match_index
-                self.next_index[peer_id] = new_match_index + 1
                 
-                print(f"[Node {self.raft_terms.id}] Node {peer_id} now has logs up to index {new_match_index}")
+                if len(health_check_args.entries) > 0:
+                    new_match_index = health_check_args.prev_log_index + len(health_check_args.entries)
+                    self.match_index[peer_id] = new_match_index
+                    self.next_index[peer_id] = new_match_index + 1
                 
-                # Check if we can advance commitIndex
-                # commitIndex = highest index replicated on majority
-                self._try_advance_commit_index()
+                    print(f"[Node {self.raft_terms.id}] Node {peer_id} now has logs up to index {new_match_index}")
+                
+                    # Check if we can advance commitIndex
+                    # commitIndex = highest index replicated on majority
+                    self._try_advance_commit_index()
+                
+                else:
+                    # Just a heartbeat, no new entries sent
+                    # Don't update matchIndex/nextIndex
+                    print(f"[Node {self.raft_terms.id}] Heartbeat to Node {peer_id} successful (no new entries)")
             
         except Exception as e:
             # Peer is down or unreachable - do nothing
@@ -670,6 +701,42 @@ class Raft(IRaftActions):
                     conn.close()
                 except:
                     pass
+                
+    def _truncate_log_file(self, keep_up_to_index):
+        """
+        Truncate log file to only keep entries [0, keep_up_to_index)
+        
+        Args:
+            keep_up_to_index: Keep entries from index 0 to keep_up_to_index-1
+                            (e.g., keep_up_to_index=2 keeps entries 0,1)
+        """
+        try:
+            log_file = self.raft_terms.logs_file_path
+            
+            # Read all existing entries
+            existing_entries = []
+            try:
+                with open(log_file, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            existing_entries.append(line)
+            except FileNotFoundError:
+                # No file yet, nothing to truncate
+                return
+            
+            # Keep only entries up to keep_up_to_index
+            entries_to_keep = existing_entries[:keep_up_to_index]
+            
+            # Rewrite file with only kept entries
+            with open(log_file, 'w') as f:
+                for entry_line in entries_to_keep:
+                    f.write(entry_line + '\n')
+            
+            print(f"[Node {self.raft_terms.id}] Truncated log file to {keep_up_to_index} entries")
+            
+        except Exception as e:
+            print(f"[Node {self.raft_terms.id}] Error truncating log file: {e}")
     
     def _try_advance_commit_index(self):
         
@@ -755,51 +822,102 @@ class Raft(IRaftActions):
         return candidate_last_index >= receiver_last_index
     
     def _persist_state(self):
-        
         """
         Persist currentTerm and votedFor to disk before responding to RPCs
         Raft Paper: "Persistent state (updated on stable storage before responding to RPCs)"
         
         Simple append-only log format (one JSON object per line) -> id, current_term, voted_for
         """
-        
         try:
-            with open(self.raft_terms.logs_file_path, 'a') as source_file:
-                state_entry = {
-                    "timestamp": datetime.datetime.now().isoformat(),
-                    "node_id": self.raft_terms.id,
-                    "current_term": self.raft_terms.current_term,
-                    "voted_for": self.raft_terms.voted_for,
-                    "state": self.raft_terms.state.name
-                }
-                source_file.write(json.dumps(state_entry) + '\n')
+            state_file = f"raft_node_{self.raft_terms.id}_state.json"
+            state = {
+                "node_id": self.raft_terms.id,
+                "current_term": self.raft_terms.current_term,
+                "voted_for": self.raft_terms.voted_for,
+                "commit_index": self.raft_terms.commit_index,
+                "last_applied": self.raft_terms.last_applied
+            }
+        
+            # Overwrite entire state file
+            with open(state_file, 'w') as f:
+                json.dump(state, f, indent=2)
         
         except Exception as e:
             print(f"[Node {self.raft_terms.id}] Error persisting state: {e}")
     
     def _load_persistent_state(self):
         """
-        Load persistent state (current_term, voted_for) when the server is boot up / restarted
-        Reads the last entry from the logs to recover the state
+        Load persistent state from TWO separate files:
+        1. State file: current_term, voted_for, commit_index, last_applied
+        2. Log file: all log entries (append-only)
         """
         
-        try:
-            
-            with open(self.raft_terms.logs_file_path, 'r') as f:
-                lines = f.readlines()
-                
-                if lines:
-                    last_entry = json.loads(lines[-1])
-                    self.raft_terms.current_term = last_entry.get('current_term', 0)
-                    self.raft_terms.voted_for = last_entry.get('voted_for', -1)
-                    print(f"[Node {self.raft_terms.id}] Recovered state: term={self.raft_terms.current_term}, voted_for={self.raft_terms.voted_for}")
+        # ===== PART 1: Load STATE file =====
+        state_file = f"raft_node_{self.raft_terms.id}_state.json"
         
+        try:
+            with open(state_file, 'r') as f:
+                state = json.load(f)
+                self.raft_terms.current_term = state.get('current_term', 0)
+                self.raft_terms.voted_for = state.get('voted_for', -1)
+                self.raft_terms.commit_index = state.get('commit_index', -1)
+                self.raft_terms.last_applied = state.get('last_applied', -1)
+                
+                print(f"[Node {self.raft_terms.id}] ✅ Recovered state: term={self.raft_terms.current_term}, voted_for={self.raft_terms.voted_for}")
+                
         except FileNotFoundError:
-            # First startup - file doesn't exist yet
-            print(f"[Node {self.raft_terms.id}] No persistent state found, starting fresh")
+            print(f"[Node {self.raft_terms.id}] No state file found, starting fresh (term=0)")
             
         except Exception as e:
-            print(f"[Node {self.raft_terms.id}] Error loading persistent state: {e}")
+            print(f"[Node {self.raft_terms.id}] ❌ Error loading state: {e}")
+        
+        
+        # ===== PART 2: Load LOG file =====
+        log_file = self.raft_terms.logs_file_path  # e.g., raft_node_A_log.jsonl
+        
+        try:
+            with open(log_file, 'r') as f:
+                self.raft_terms.logs = []  # Clear existing logs
+                
+                for line_num, line in enumerate(f):
+                    line = line.strip()
+                    if not line:
+                        continue  # Skip empty lines
+                    
+                    try:
+                        entry = json.loads(line)
+                        
+                        # Reconstruct log entry as plain dict (not netref)
+                        log_entry = {
+                            "term": int(entry["term"]),
+                            "command": str(entry["command"])
+                        }
+                        
+                        self.raft_terms.logs.append(log_entry)
+                        
+                    except json.JSONDecodeError as e:
+                        print(f"[Node {self.raft_terms.id}] ⚠️  Skipping corrupted log line {line_num}: {e}")
+                        continue
+                
+                # Update metadata after loading all logs
+                if self.raft_terms.logs:
+                    self.raft_terms.last_log_index = len(self.raft_terms.logs) - 1
+                    self.raft_terms.last_log_term = self.raft_terms.logs[-1]["term"]
+                    print(f"[Node {self.raft_terms.id}] ✅ Recovered {len(self.raft_terms.logs)} log entries (last_index={self.raft_terms.last_log_index})")
+                else:
+                    self.raft_terms.last_log_index = -1
+                    self.raft_terms.last_log_term = 0
+                    print(f"[Node {self.raft_terms.id}] No log entries found")
+                    
+        except FileNotFoundError:
+            print(f"[Node {self.raft_terms.id}] No log file found, starting with empty log")
+            self.raft_terms.logs = []
+            self.raft_terms.last_log_index = -1
+            self.raft_terms.last_log_term = 0
+            
+        except Exception as e:
+            print(f"[Node {self.raft_terms.id}] ❌ Error loading logs: {e}")
+            self.raft_terms.logs = []
         
     
     def killed(self):

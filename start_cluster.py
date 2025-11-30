@@ -36,7 +36,7 @@ class RaftCluster:
         raft_node = Raft(
             node_id=node_id,
             peers_config=peers_config,
-            logs_file_path=f"raft_node_{node_id}.log",
+            logs_file_path=f"raft_node_{node_id}.jsonl",
             state_machine_applier=applier
         )
         

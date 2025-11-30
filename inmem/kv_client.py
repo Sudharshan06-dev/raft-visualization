@@ -1,6 +1,6 @@
 import rpyc
 from typing import Optional, Dict, Any, List, Tuple
-from kv_command import create_set_command, create_delete_command, serialize_command
+from inmem.kv_command import create_set_command, create_delete_command, serialize_command
 
 
 class KVClient:
@@ -85,18 +85,14 @@ class KVClient:
                 # Query for leader info
                 result = conn.root.exposed_get_leader()
                 
-                # Convert rpyc netref to dict if needed
-                if hasattr(result, 'keys'):
-                    result = dict(result)
-                
                 # Check if this node knows the leader
-                if result.get("state") == "leader":
+                if result["state"] == "leader":
                     self._leader_id = result["node_id"]
                     print(f"[KVClient] Discovered leader: {self._leader_id}")
                     return self._leader_id
                 
                 # If node knows who the leader is
-                if result.get("leader_id"):
+                if result["leader_id"]:
                     self._leader_id = result["leader_id"]
                     print(f"[KVClient] Discovered leader: {self._leader_id}")
                     return self._leader_id
@@ -134,18 +130,14 @@ class KVClient:
                 # Send command to leader
                 result = conn.root.exposed_append_log_entries(serialized_command)
                 
-                # Convert rpyc netref to dict if needed
-                if hasattr(result, 'keys'):
-                    result = dict(result)
-                
                 # Success - return result
-                if result.get("success"):
+                if result["success"]:
                     return result
 
                 # Not leader error - update leader hint and retry
-                if result.get("error") == "NOT_LEADER":
+                if result["error"] == "NOT_LEADER":
                     print(f"[KVClient] {self._leader_id} is not leader, retrying...")
-                    self._leader_id = result.get("leader_hint")
+                    self._leader_id = result["leader_hint"]
                     continue
                 
                 # Other error - return to caller
@@ -203,10 +195,6 @@ class KVClient:
             conn = self._get_connection(target_node)
             result = conn.root.exposed_read_kv(key, field, timestamp)
             
-            # Convert rpyc netref to dict if needed
-            if hasattr(result, 'keys'):
-                result = dict(result)
-            
             return result
         
         except Exception as e:
@@ -245,10 +233,6 @@ class KVClient:
             conn = self._get_connection(target)
             result = conn.root.exposed_scan_kv(key, timestamp)
             
-            # Convert rpyc netref to dict if needed
-            if hasattr(result, 'keys'):
-                result = dict(result)
-            
             return result
         
         except Exception as e:
@@ -274,10 +258,6 @@ class KVClient:
         try:
             conn = self._get_connection(target)
             result = conn.root.exposed_scan_kv_by_prefix(key, prefix, timestamp)
-            
-            # Convert rpyc netref to dict if needed
-            if hasattr(result, 'keys'):
-                result = dict(result)
             
             return result
             
