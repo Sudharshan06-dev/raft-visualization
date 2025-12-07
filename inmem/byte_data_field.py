@@ -6,7 +6,7 @@ class ByteDataField(IByteDataField):
     def __init__(self, value: str, created_at: int, ttl: Optional[int]):
         self.value = value
         self.created_at = created_at
-        self.ttl = ttl
+        self.ttl = ttl * 1000 if ttl is not None else None #convert seconds to timestamp - so 10 seconds becomes 10000
 
     def is_alive(self, timestamp: int) -> bool:
         if self.ttl is None:

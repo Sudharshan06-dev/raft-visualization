@@ -33,10 +33,32 @@ class ByteDataDB:
         return self._store.get(key)
 
     def get_at(self, key: str, field: str, timestamp: int) -> Optional[str]:
+        
         record = self._store.get(key)
+        print(f'record here: {record}')
+        
         if not record:
             return None
-        return record.get_field(field, timestamp)
+        
+        # ✅ DEBUG: Print all fields in the record
+        print(f'[DEBUG] Record fields dict: {record.fields}')
+        print(f'[DEBUG] All field names in record: {list(record.fields.keys())}')
+        print(f'[DEBUG] Looking for field: "{field}"')
+        print(f'[DEBUG] Field exists? {field in record.fields}')
+        
+        # ✅ DEBUG: Print details of each field
+        for field_name, field_obj in record.fields.items():
+            print(f'[DEBUG] Field "{field_name}":')
+            print(f'  - Type: {type(field_obj)}')
+            print(f'  - Value: {field_obj.value}')
+            print(f'  - Created at: {field_obj.created_at}')
+            print(f'  - TTL: {field_obj.ttl}')
+            print(f'  - Is alive at {timestamp}? {field_obj.is_alive(timestamp)}')
+        
+        result = record.get_field(field, timestamp)
+        print(f'[DEBUG] get_field("{field}", {timestamp}) returned: {result}')
+        
+        return result
 
     def delete_at(self, key: str, field: str, timestamp: int) -> bool:
         record = self._store.get(key)

@@ -194,9 +194,12 @@ class KVClient:
         try:
             conn = self._get_connection(target_node)
             result = conn.root.exposed_read_kv(key, field, timestamp)
-            
-            return result
-        
+                                    
+            return {
+                "success": result["success"], 
+                "value": result["value"]
+            }
+                    
         except Exception as e:
             print(f"[KVClient] Error reading from {target_node}: {e}")
             self._close_connection(target_node)
@@ -233,7 +236,10 @@ class KVClient:
             conn = self._get_connection(target)
             result = conn.root.exposed_scan_kv(key, timestamp)
             
-            return result
+            return {
+                "success": result["success"],
+                "fields": list(result["fields"])  # Convert list netref to local list
+            }
         
         except Exception as e:
             print(f"[KVClient] Error scanning from {target}: {e}")
@@ -259,8 +265,11 @@ class KVClient:
             conn = self._get_connection(target)
             result = conn.root.exposed_scan_kv_by_prefix(key, prefix, timestamp)
             
-            return result
-            
+            return {
+                "success": result["success"],
+                "fields": list(result["fields"])  # Convert list netref to local list
+            }
+                    
         except Exception as e:
             print(f"[KVClient] Error scanning from {target}: {e}")
             self._close_connection(target)

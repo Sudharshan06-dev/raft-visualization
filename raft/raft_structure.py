@@ -33,11 +33,11 @@ class RaftStructure:
     Being committed means "this will never be lost, it's agreed upon"
     But it still hasn't been executed!
     """
-    commit_index: int = 0 #Index of highest log entry known to be committed (initialized to 0)
+    commit_index: int = -1 #Index of highest log entry known to be committed (initialized to -1)
     """
     An entry is applied when you actually run db.set_at() on the state machine
     This is when the KV store actually gets updated
     You can't apply until it's committed (safety requirement)
     """
-    last_applied: int = 0
+    last_applied: int = -1
     election_timer: float = 0.5 #Election timeout value in seconds (randomized between 300-500ms)

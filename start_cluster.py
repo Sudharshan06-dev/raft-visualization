@@ -41,9 +41,7 @@ class RaftCluster:
         )
         
         # Create RPC service
-        service = RaftService()
-        service._raft = raft_node
-        service._db = db
+        service = RaftService(raft_node, db)
         
         node_config = self.config[node_id]
         server = ThreadedServer(

@@ -1,11 +1,12 @@
 from typing import Dict, Any
 from inmem.kv_command import deserialize_command, CommandType
+from inmem.byte_data_db import ByteDataDB
 
 
 class StateMachineApplier:
     """Applies RAFT log commands to the ByteDataDB state machine."""
     
-    def __init__(self, db):
+    def __init__(self, db: ByteDataDB):
         self.db = db
     
     def apply(self, command_str: str) -> Dict[str, Any]:

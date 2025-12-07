@@ -12,11 +12,11 @@ class RaftService(rpyc.Service):
     - Client operations (read/write)
     """
     
-    def __init__(self):
+    def __init__(self, raft: Raft, db: ByteDataDB):
         super().__init__()
         # Will be set from run_server()
-        self._raft = None
-        self._db = None
+        self._raft = raft
+        self._db = db
     
     # ==================== PHASE 1: LEADER ELECTION ====================
     
@@ -112,7 +112,7 @@ class RaftService(rpyc.Service):
         value = self._db.get_at(key, field, timestamp)
         if value is not None:
             return {"success": True, "value": value}
-        return {"success": False, "error": "NOT_FOUND"}
+        return {"success": False, "value": "NOT_FOUND"}
     
     def exposed_scan_kv(self, key: str, timestamp: int):
         """Scan all fields for a key."""
@@ -146,9 +146,7 @@ def run_server(host="127.0.0.1", port=5001, node_id=0, peers_config=None):
     )
     
     # Create RPC service with both RAFT and DB
-    service = RaftService()
-    service._raft = raft_node
-    service._db = db  # <-- For direct reads
+    service = RaftService(raft_node, db)
     
     # Start RAFT threads
     raft_node.start_raft_node()

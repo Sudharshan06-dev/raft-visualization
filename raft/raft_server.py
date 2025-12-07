@@ -43,8 +43,8 @@ class Raft(IRaftActions):
             peers=peers_config if peers_config else {},
             state=RaftState.follower,
             logs=[],  # ADDED
-            commit_index=0,  # ADDED: Highest log index committed
-            last_applied=0   # ADDED: Highest log index applied to state machine
+            commit_index=-1,  # ADDED: Highest log index committed
+            last_applied=-1   # ADDED: Highest log index applied to state machine
         )
         
         # Load persistent state from disk if it exists - what if the server has crashed and it has restarted
@@ -174,12 +174,15 @@ class Raft(IRaftActions):
                 log_index = len(self.raft_terms.logs) - 1  # Calculate index from position
                 self.raft_terms.last_log_index = len(self.raft_terms.logs) - 1
                 self.raft_terms.last_log_term = self.raft_terms.current_term
+                self.match_index[self.raft_terms.id] = log_index
                 self.next_index[self.raft_terms.id] = len(self.raft_terms.logs)
             
                 # Rule 3: Persist to disk immediately (required by Raft)
                 self._persist_log_entry(log_entry)
-                
+                                
                 print(f"[Node {self.raft_terms.id}] Appended log entry at index {log_index}")
+                
+                
 
                 # Rule 4: Return to client
                 # Client can:
@@ -365,6 +368,9 @@ class Raft(IRaftActions):
                         self.next_index[peer_id] = len(self.raft_terms.logs)
                         self.match_index[peer_id] = -1
                 
+                # Initialize OWN matchIndex
+                self.match_index[self.raft_terms.id] = len(self.raft_terms.logs) - 1
+                
                 won_election = True  # ← Set flag
     
         # Step 8: Send immediate heartbeat OUTSIDE the lock
@@ -454,10 +460,10 @@ class Raft(IRaftActions):
                 print(f"[Node {self.raft_terms.id}] Sending heartbeats...") 
                 self.send_health_checks()
             
-            # Wait 100ms before next heartbeat
-            # This is MUCH shorter than election timeout (300-500ms)
+            # Wait 3 seconds before next heartbeat
+            # This is MUCH shorter than election timeout
             # to prevent followers from timing out
-            self.heartbeat_timer_event.wait(timeout=4.5)  # 100ms
+            self.heartbeat_timer_event.wait(timeout=3)
     
     def send_health_checks(self):
         
@@ -576,6 +582,7 @@ class Raft(IRaftActions):
                 print(f"[Node {self.raft_terms.id}] Appended {len(health_check_arguments.entries)} entries")
             
             # Rule 5: Update commitIndex
+            print(f'RULE 5 CHECK HERE {self.raft_terms.id}  - {health_check_arguments.leader_commit} {self.raft_terms.commit_index}')
             if health_check_arguments.leader_commit > self.raft_terms.commit_index:
                 old_commit = self.raft_terms.commit_index
                 self.raft_terms.commit_index = min(
@@ -762,7 +769,8 @@ class Raft(IRaftActions):
                 if self.match_index.get(peer_id, 0) >= index:
                     replicated_count += 1
             
-            total_servers = len(self.raft_terms.peers)
+            #  FIX: Include self in total_servers calculation
+            total_servers = len(self.raft_terms.peers) + 1  # +1 for self
             majority = (total_servers // 2) + 1
             
             # Only commit entries from current term (§5.4.2)
@@ -773,6 +781,10 @@ class Raft(IRaftActions):
                 
                 # Apply newly committed entries
                 self._apply_committed_entries()
+                
+                # Persist state change
+                self._persist_state()
+                
                 break
             
             
