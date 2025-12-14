@@ -4,6 +4,8 @@ from raft.IRaftActions import IRaftActions
 from raft.raft_structure import RaftStructure
 from raft.raft_state import RaftState
 import random
+from raft.raft_websocket_manager import WebSocketManager
+import asyncio
 import concurrent.futures
 import datetime
 import json
@@ -30,6 +32,9 @@ class Raft(IRaftActions):
         # ADDED: Thread safety lock for concurrent RPC access
         self.lock = threading.Lock()
         
+        #ADDED: Websocker manager to sync it with the UI
+        self.ws_manager = WebSocketManager.get_ws_manager()
+            
         # ADDED: State machine applier (for applying committed log entries to KV store)
         self.state_machine_applier = state_machine_applier
         
@@ -488,10 +493,46 @@ class Raft(IRaftActions):
             if self.raft_terms.state != RaftState.leader:
                 return
             
-            print(f"SEND HELATH CHECK TO PEERS ARRIVED {self.raft_terms.state}")
+            print(f"SEND HEALTH CHECK TO PEERS ARRIVED {self.raft_terms.state}")
+            
+            # ADDED: Collect followers list for WebSocket broadcast
+            followers = [peer_id for peer_id in self.raft_terms.peers.keys() if peer_id != self.raft_terms.id]
             
             peers = dict(self.raft_terms.peers)
         
+        try:
+            print(f"[Node {self.raft_terms.id}] Broadcasting heartbeat to UI...")
+            
+            # ← FIX: Get the loop from WebSocketManager (which has the running loop)
+            loop = self.ws_manager.event_loop
+            
+            if loop is None:
+                print(f"[Node {self.raft_terms.id}] ERROR: WebSocketManager event_loop not initialized!")
+                return
+            
+            if not loop.is_running():
+                print(f"[Node {self.raft_terms.id}] ERROR: Event loop is not running!")
+                return
+            
+            # Now schedule the coroutine on the running loop
+            asyncio.run_coroutine_threadsafe(
+                self.ws_manager.broadcast_heartbeat(
+                    leader_id=self.raft_terms.id,
+                    current_term=self.raft_terms.current_term,
+                    last_log_index=self.raft_terms.last_log_index,
+                    last_log_term=self.raft_terms.last_log_term,
+                    followers=followers,
+                    peer_responses={},
+                ),
+                loop,
+            )
+            print(f"[Node {self.raft_terms.id}] Coroutine scheduled on event loop")
+            
+        except Exception as e:
+            print(f"[Node {self.raft_terms.id}] WebSocket broadcast error: {e}")
+            import traceback
+            traceback.print_exc()  # Print full traceback for debugging
+            
         # Send to all peers IN PARALLEL
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(peers)) as executor:
             for peer_id, peer_value in peers.items():
@@ -652,12 +693,31 @@ class Raft(IRaftActions):
             conn = rpyc.connect(
                 peer_value["host"],
                 peer_value["port"],
-                config={"allow_public_attrs": True}
+                config={"allow_public_attrs": True, "instantiate_remote_objects": True}
             )
-            
+    
             result = conn.root.exposed_send_health_check_request(health_check_args)
             
             print(f"[Node {self.raft_terms.id}] RPC to Node {peer_id}: {result}")
+            
+            # after getting `result`:
+            try:
+                success = result['success'] if result and result['success'] else False
+                loop = self.ws_manager.event_loop
+                
+                if loop and loop.is_running():
+                    asyncio.run_coroutine_threadsafe(
+                        self.ws_manager.broadcast_peer_response(
+                        leader_id=self.raft_terms.id,
+                        peer_id=peer_id,
+                        success=success,
+                        result=result,
+                        ),
+                        loop,
+                    )
+                print(f"[Node {self.raft_terms.id}] Broadcast successful for {peer_id}")
+            except Exception as e:
+                print(f"[Node {self.raft_terms.id}] WebSocket peer response broadcast error: {e}")
             
             with self.lock:
                 
@@ -679,7 +739,7 @@ class Raft(IRaftActions):
 
                     return
 
-                #If success=True: follower accepted the entries
+                # If success=True: follower accepted the entries
                 # Update matchIndex and nextIndex for this peer
                 
                 if len(health_check_args.entries) > 0:
@@ -797,7 +857,7 @@ class Raft(IRaftActions):
             conn = rpyc.connect(
                 peer_value["host"],
                 peer_value["port"],
-                config={"allow_public_attrs": True}
+                config={"allow_public_attrs": True, "instantiate_remote_objects": True}
             )
             result = conn.root.exposed_send_vote_request(vote_arguments)
             

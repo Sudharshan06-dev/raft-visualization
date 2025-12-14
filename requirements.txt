@@ -1,1 +1,4 @@
 rpyc
+fastapi
+uvicorn
+python-multipart
