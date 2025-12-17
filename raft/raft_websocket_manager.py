@@ -111,6 +111,7 @@ class WebSocketManager:
         await self._broadcast_now(message)
 
     async def broadcast_log_entry(self, node_id: str, log_entry: Dict, log_index: int, committed: bool = False):
+        print(f"broadcast_log_entry EXECUTING {node_id}")
         message = {
             "type": "log_entry",
             "node_id": str(node_id),
@@ -119,6 +120,47 @@ class WebSocketManager:
             "committed": bool(committed),
             "timestamp": datetime.utcnow().isoformat(),
         }
+        await self._broadcast_now(message)
+    
+    async def broadcast_entries_committed(
+        self,
+        node_id: str,
+        committed_until_index: int,
+        current_term: int,
+    ):
+        """Broadcast when entries are committed (majority replicated)."""
+        message = {
+            "type": "entries_committed",
+            "node_id": str(node_id),
+            "committed_until_index": int(committed_until_index),
+            "current_term": int(current_term),
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        await self._broadcast_now(message)
+    
+    async def broadcast_kv_store_update(
+        self,
+        node_id: str,
+        log_index: int,
+        log_entry: Dict,
+        result: str | None = None,
+    ):
+        """Broadcast when entry is applied to state machine."""
+        key = result.get('key', None)
+        field = result.get('field', None)
+        value = result.get('value', None)
+        
+        message = {
+            "type": "kv_store_update",
+            "node_id": str(node_id),
+            "log_index": int(log_index),
+            "log_entry": self._make_serializable(log_entry),
+            "key": key,
+            "field": field,
+            "value": value,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        
         await self._broadcast_now(message)
 
     async def _broadcast_now(self, message: Dict):

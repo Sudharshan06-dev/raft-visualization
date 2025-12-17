@@ -44,7 +44,9 @@ class StateMachineApplier:
             "success": True,
             "operation": "SET",
             "key": command["key"],
-            "field": command["field"]
+            "field": command["field"],
+            "value":command["value"],
+            "timestamp": command["timestamp"],
         }
     
     def _apply_delete(self, command: Dict[str, Any]) -> Dict[str, Any]:

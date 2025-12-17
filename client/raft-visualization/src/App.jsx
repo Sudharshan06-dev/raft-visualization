@@ -9,16 +9,19 @@ const nodeCoords = {
 
 const RaftVisualizationWithWebSocket = () => {
   const [inputKey, setInputKey] = useState('');
+  const [inputField, setInputField] = useState('');
   const [inputValue, setInputValue] = useState('');
 
-  // Logs per node, driven by backend
+  // Logs per node, driven entirely by backend
   const [nodeLogEntries, setNodeLogEntries] = useState({
     A: [],
     B: [],
     C: [],
   });
 
-  // KV store committed entries, driven by backend
+  // KV store with key -> field -> value structure
+  // Structure: { key1: { field1: value1, field2: value2 }, key2: { fieldA: valueA } }
+  const [kvMetadata, setKvMetadata] = useState({});
   const [committedKVStore, setCommittedKVStore] = useState({});
 
   const [activeMessage, setActiveMessage] = useState(null);
@@ -40,7 +43,7 @@ const RaftVisualizationWithWebSocket = () => {
     setDebugMessages((prev) => [...prev.slice(-4), msg]);
   };
 
-  // WebSocket setup (dynamic, no hardcoded leader/KV)
+  // WebSocket setup
   useEffect(() => {
     const connectWebSocket = () => {
       try {
@@ -104,8 +107,11 @@ const RaftVisualizationWithWebSocket = () => {
         case 'log_entry':
           handleLogEntry(message);
           break;
-        case 'kv_update':
-          handleKVUpdate(message);
+        case 'entries_committed':
+          handleEntriesCommitted(message);
+          break;
+        case 'kv_store_update':
+          handleKVStoreUpdate(message);
           break;
         default:
           addDebug(`⚠️ Unknown message type: ${message.type}`);
@@ -116,16 +122,6 @@ const RaftVisualizationWithWebSocket = () => {
   };
 
   const handleHeartbeat = (message) => {
-    // expected shape:
-    // {
-    //   type: 'heartbeat',
-    //   leader_id: 'A' | 'B' | 'C',
-    //   current_term: number,
-    //   last_log_index: number,
-    //   last_log_term: number,
-    //   followers: ['A','B','C'] minus leader,
-    //   timestamp: number | string
-    // }
     const {
       leader_id,
       current_term,
@@ -142,7 +138,7 @@ const RaftVisualizationWithWebSocket = () => {
     setFollowers(Array.isArray(hbFollowers) ? hbFollowers : []);
     setLastHeartbeatTime(timestamp ? new Date(timestamp) : new Date());
 
-    // reset peer responses for this heartbeat
+    // Reset peer responses for this heartbeat
     const newResponses = {};
     (hbFollowers || []).forEach((f) => {
       newResponses[f] = { success: null, term: null, matchIndex: null };
@@ -156,16 +152,9 @@ const RaftVisualizationWithWebSocket = () => {
   };
 
   const handlePeerResponse = (message) => {
-    // expected shape:
-    // {
-    //   type: 'peer_response',
-    //   peer_id: 'A' | 'B' | 'C',
-    //   leader_id: 'A' | 'B' | 'C',
-    //   result: { success: boolean, term: number, matchIndex?: number }
-    // }
     const { peer_id, leader_id, result } = message;
     if (!peer_id || !leader_id || !result) {
-      addDebug('⚠️ peer_response missing fields');
+      addDebug('peer_response missing fields');
       return;
     }
 
@@ -189,8 +178,6 @@ const RaftVisualizationWithWebSocket = () => {
   };
 
   const handleNodeStateChange = (message) => {
-    // expected shape:
-    // { type: 'node_state_change', node_id: 'A'|'B'|'C', new_state: 'leader'|'follower'|'candidate', current_term: number }
     const { node_id, new_state, current_term } = message;
     if (new_state === 'leader') {
       setLeaderId(node_id);
@@ -199,19 +186,13 @@ const RaftVisualizationWithWebSocket = () => {
   };
 
   const handleLogEntry = (message) => {
-    // expected shape:
-    // {
-    //   type: 'log_entry',
-    //   node_id: 'A'|'B'|'C',
-    //   log_entry: { command: string, key?: string, value?: string },
-    //   log_index: number,
-    //   committed: boolean
-    // }
     const { node_id, log_entry, log_index, committed } = message;
     if (!node_id || !log_entry || log_index == null) {
       addDebug('⚠️ log_entry missing fields');
       return;
     }
+
+    addDebug(`Log entry on Node ${node_id}: "${log_entry}"`);
 
     setNodeLogEntries((prev) => ({
       ...prev,
@@ -219,67 +200,141 @@ const RaftVisualizationWithWebSocket = () => {
         ...prev[node_id],
         {
           id: log_index,
-          value: log_entry.command,
+          value: log_entry.command || String(log_entry),
           committed: !!committed,
         },
       ],
+
     }));
+  };
 
-    // optionally, backend can also tell us when to update KV store for committed entries
-    if (committed && log_entry.key && typeof log_entry.value !== 'undefined') {
-      setCommittedKVStore((prev) => ({
-        ...prev,
-        [log_entry.key]: log_entry.value,
-      }));
+  // React component - Replace handleEntriesCommitted function
+
+  const handleEntriesCommitted = (message) => {
+    try {
+      const { committed_until_index } = message;
+      addDebug(`Entries committed up to index ${committed_until_index}`);
+
+      // UPDATE existing entries (don't create duplicates!)
+      setNodeLogEntries((prev) => {
+        const updated = {};
+
+        ['A', 'B', 'C'].forEach((nId) => {
+          updated[nId] = prev[nId].map((entry) => {
+            // Only update entries that exist and aren't already committed
+            if (entry.id <= committed_until_index && !entry.committed) {
+              return { ...entry, committed: true };
+            }
+            return entry;
+          });
+        });
+
+        return updated;
+      });
+    } catch (e) {
+      addDebug(` Error in handleEntriesCommitted: ${e.message}`);
     }
   };
 
-  const handleKVUpdate = (message) => {
-    // optional direct KV update message from backend:
-    // { type: 'kv_update', store: { k: v, ... } } or { type: 'kv_update', key, value }
-    if (message.store && typeof message.store === 'object') {
-      setCommittedKVStore(message.store);
-    } else if (message.key) {
-      setCommittedKVStore((prev) => ({
+  const handleKVStoreUpdate = (message) => {
+    try {
+      const { node_id, log_index, key, field, value, timestamp } = message;
+
+      // Validate all required fields
+      if (!node_id || log_index == null) {
+        addDebug(`KV update missing: node_id=${node_id}, log_index=${log_index}`);
+        return;
+      }
+
+      if (!key || !field || value === undefined || value === null) {
+        addDebug(`KV update invalid: key=${key}, field=${field}, value=${value}`);
+        return;
+      }
+
+      // Create unique ID
+      const updateId = `${node_id}-${log_index}-${key}-${field}`;
+
+      // Optional: Track processed updates
+      setKvMetadata((prev) => ({
         ...prev,
-        [message.key]: message.value,
+        [`${key}-${field}`]: {
+          node_id,
+          log_index,
+          timestamp: timestamp || new Date().toISOString(),
+          updated_at: new Date().toLocaleTimeString(),
+        },
       }));
+
+      addDebug(`KV Store [Node ${node_id}]: ${key}.${field} = ${value}`);
+
+      // Update main data
+      setCommittedKVStore((prev) => {
+        const existing = prev[String(key)]?.[String(field)];
+
+        if (existing === String(value)) {
+          return prev;
+        }
+
+        return {
+          ...prev,
+          [String(key)]: {
+            ...(prev[String(key)] || {}),
+            [String(field)]: String(value),
+          },
+        };
+      });
+    } catch (e) {
+      addDebug(`KV store update error: ${e.message}`);
     }
   };
 
-  const handleSubmitKVEntry = () => {
-    if (!inputKey.trim() || !inputValue.trim()) {
-      alert('Please enter both key and value');
-      return;
-    }
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-      alert('WebSocket not connected');
+  const handleSubmitKVEntry = async () => {
+    if (!inputKey.trim() || !inputField.trim() || !inputValue.trim()) {
+      alert('Please enter key, field, and value');
       return;
     }
 
     setIsSubmitting(true);
 
-    // Expected by backend: a client command message
-    // e.g. { type: 'client_command', command: 'SET key = value', key, value }
-    const command = `SET ${inputKey} = ${inputValue}`;
     const payload = {
       type: 'client_command',
-      command,
+      command: `SET ${inputKey}.${inputField} = ${inputValue}`,
       key: inputKey,
+      field: inputField,
       value: inputValue,
     };
 
     try {
-      wsRef.current.send(JSON.stringify(payload));
-      addDebug(`📤 Sent client_command: ${command}`);
-    } catch (e) {
-      addDebug(`❌ Failed to send client_command: ${e.message}`);
-    }
+      const response = await fetch(`http://localhost:8765/kv-store`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+      });
 
-    setInputKey('');
-    setInputValue('');
-    setTimeout(() => setIsSubmitting(false), 300);
+      const data = await response.json();
+
+      if (!response.ok) {
+        console.error('SET failed:', data);
+        throw new Error(data.message || `HTTP ${response.status}`);
+      }
+
+      console.log('SET successful:', data);
+
+      // Clear inputs on success
+      setInputKey('');
+      setInputField('');
+      setInputValue('');
+      return data;
+    } catch (err) {
+      console.error('SET error:', err);
+      throw err;
+    } finally {
+      setIsSubmitting(false);
+    }
   };
+
 
   const nodeColors = {
     leader: {
@@ -296,6 +351,180 @@ const RaftVisualizationWithWebSocket = () => {
     if (!leaderId) return 'FOLLOWER';
     return nodeId === leaderId ? 'LEADER' : 'FOLLOWER';
   };
+
+  // Enhanced: Get rows with metadata
+  const getKVStoreRows = () => {
+    const rows = [];
+    Object.entries(committedKVStore).forEach(([key, fieldsObj]) => {
+      if (fieldsObj && typeof fieldsObj === 'object') {
+        Object.entries(fieldsObj).forEach(([field, value]) => {
+          const metaKey = `${key}-${field}`;
+          rows.push({
+            key,
+            field,
+            value,
+            node_id: kvMetadata[metaKey]?.node_id || '-',
+            updated_at: kvMetadata[metaKey]?.updated_at || '-',
+          });
+        });
+      }
+    });
+    return rows;
+  };
+
+  
+// Enhanced table with node and timestamp columns
+const enhancedTableUI = (
+  <div
+    style={{
+      background: 'rgba(30, 41, 59, 0.8)',
+      border: '1px solid rgba(71, 85, 105, 0.4)',
+      borderRadius: '12px',
+      padding: '1.5rem',
+      backdropFilter: 'blur(10px)',
+      marginBottom: '2rem',
+    }}
+  >
+    <h2
+      style={{
+        fontSize: '1.2rem',
+        fontWeight: '700',
+        margin: '0 0 1rem 0',
+        color: '#10b981',
+      }}
+    >
+      Committed KV Store (State Machine)
+    </h2>
+    {getKVStoreRows().length === 0 ? (
+      <div
+        style={{
+          color: '#64748b',
+          fontSize: '12px',
+          fontStyle: 'italic',
+          padding: '1rem',
+        }}
+      >
+        No committed entries yet...
+      </div>
+    ) : (
+      <div style={{ overflowX: 'auto' }}>
+        <table
+          style={{
+            width: '100%',
+            borderCollapse: 'collapse',
+            fontSize: '12px',
+          }}
+        >
+          <thead>
+            <tr
+              style={{
+                borderBottom: '2px solid rgba(16, 185, 129, 0.3)',
+              }}
+            >
+              <th
+                style={{
+                  padding: '0.75rem',
+                  textAlign: 'left',
+                  color: '#10b981',
+                  fontWeight: '700',
+                  width: '20%',
+                }}
+              >
+                Key
+              </th>
+              <th
+                style={{
+                  padding: '0.75rem',
+                  textAlign: 'left',
+                  color: '#10b981',
+                  fontWeight: '700',
+                  width: '20%',
+                }}
+              >
+                Field
+              </th>
+              <th
+                style={{
+                  padding: '0.75rem',
+                  textAlign: 'left',
+                  color: '#10b981',
+                  fontWeight: '700',
+                  width: '30%',
+                }}
+              >
+                Value
+              </th>
+              <th
+                style={{
+                  padding: '0.75rem',
+                  textAlign: 'left',
+                  color: '#10b981',
+                  fontWeight: '700',
+                  width: '15%',
+                }}
+              >
+                Updated
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            {getKVStoreRows().map((row, idx) => (
+              <motion.tr
+                key={`kv-${row.key}-${row.field}-${idx}`}
+                initial={{ opacity: 0, y: -10 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ duration: 0.5 }}
+                style={{
+                  borderBottom: '1px solid rgba(71, 85, 105, 0.3)',
+                }}
+              >
+                <td
+                  style={{
+                    padding: '0.75rem',
+                    color: '#cbd5e1',
+                    fontFamily: 'monospace',
+                    wordBreak: 'break-word',
+                  }}
+                >
+                  {String(row.key)}
+                </td>
+                <td
+                  style={{
+                    padding: '0.75rem',
+                    color: '#cbd5e1',
+                    fontFamily: 'monospace',
+                    wordBreak: 'break-word',
+                  }}
+                >
+                  {String(row.field)}
+                </td>
+                <td
+                  style={{
+                    padding: '0.75rem',
+                    color: '#10b981',
+                    fontFamily: 'monospace',
+                    wordBreak: 'break-word',
+                  }}
+                >
+                  {String(row.value)}
+                </td>
+                <td
+                  style={{
+                    padding: '0.75rem',
+                    color: '#94a3b8',
+                    fontSize: '11px',
+                  }}
+                >
+                  {row.updated_at}
+                </td>
+              </motion.tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    )}
+  </div>
+);
 
   return (
     <div
@@ -329,31 +558,6 @@ const RaftVisualizationWithWebSocket = () => {
           overflowY: 'auto',
         }}
       >
-        <div
-          style={{
-            fontWeight: 'bold',
-            marginBottom: '5px',
-            color: '#f1f5f9',
-          }}
-        >
-          📊 Debug Console
-        </div>
-        {debugMessages.map((msg, idx) => (
-          <div
-            key={idx}
-            style={{
-              marginBottom: '4px',
-              lineHeight: '1.3',
-              color: msg.includes('❌')
-                ? '#ef4444'
-                : msg.includes('✅')
-                  ? '#10b981'
-                  : '#cbd5e1',
-            }}
-          >
-            {msg}
-          </div>
-        ))}
       </div>
 
       {/* Header */}
@@ -427,7 +631,7 @@ const RaftVisualizationWithWebSocket = () => {
         </div>
       </div>
 
-      {/* Input KV Store */}
+      {/* Input KV Store - Updated for Key.Field = Value */}
       <div
         style={{
           background: 'rgba(30, 41, 59, 0.8)',
@@ -451,7 +655,7 @@ const RaftVisualizationWithWebSocket = () => {
         <div
           style={{
             display: 'grid',
-            gridTemplateColumns: '1fr 1fr auto',
+            gridTemplateColumns: '1fr 1fr 1fr auto',
             gap: '1rem',
             alignItems: 'flex-end',
           }}
@@ -472,6 +676,37 @@ const RaftVisualizationWithWebSocket = () => {
               value={inputKey}
               onChange={(e) => setInputKey(e.target.value)}
               placeholder="Enter key..."
+              disabled={isSubmitting || connectionStatus !== 'connected'}
+              style={{
+                width: '100%',
+                padding: '0.75rem',
+                borderRadius: '6px',
+                border: '1px solid rgba(71, 85, 105, 0.5)',
+                background: 'rgba(15, 23, 42, 0.6)',
+                color: '#f1f5f9',
+                fontFamily: 'inherit',
+                fontSize: '0.95rem',
+                opacity:
+                  isSubmitting || connectionStatus !== 'connected' ? 0.6 : 1,
+              }}
+            />
+          </div>
+          <div>
+            <label
+              style={{
+                fontSize: '0.9rem',
+                color: '#cbd5e1',
+                display: 'block',
+                marginBottom: '0.5rem',
+              }}
+            >
+              Field
+            </label>
+            <input
+              type="text"
+              value={inputField}
+              onChange={(e) => setInputField(e.target.value)}
+              placeholder="Enter field..."
               disabled={isSubmitting || connectionStatus !== 'connected'}
               style={{
                 width: '100%',
@@ -524,6 +759,7 @@ const RaftVisualizationWithWebSocket = () => {
               isSubmitting ||
               connectionStatus !== 'connected' ||
               !inputKey.trim() ||
+              !inputField.trim() ||
               !inputValue.trim()
             }
             style={{
@@ -585,8 +821,7 @@ const RaftVisualizationWithWebSocket = () => {
               marginBottom: '1.5rem',
             }}
           >
-            Node Network (Term {currentTerm ?? '-'}
-            )
+            Node Network (Term {currentTerm ?? '-'})
           </h3>
 
           <div
@@ -637,7 +872,7 @@ const RaftVisualizationWithWebSocket = () => {
                 leaderId &&
                 followers.map((f) => (
                   <motion.line
-                    key={f}
+                    key={`hb-${f}`}
                     x1={nodeCoords[leaderId].x}
                     y1={nodeCoords[leaderId].y}
                     x2={nodeCoords[f].x}
@@ -682,158 +917,46 @@ const RaftVisualizationWithWebSocket = () => {
                   />
                 )}
 
-              {/* Node A */}
-              <circle
-                cx={nodeCoords.A.x}
-                cy={nodeCoords.A.y}
-                r={50}
-                fill={
-                  nodeColors[
-                    leaderId === 'A' ? 'leader' : 'follower'
-                  ].gradient
-                }
-                style={{
-                  filter: `drop-shadow(0 4px 12px ${nodeColors[
-                      leaderId === 'A' ? 'leader' : 'follower'
-                    ].shadow
-                    })`,
-                }}
-              />
-              <text
-                x={nodeCoords.A.x}
-                y={nodeCoords.A.y - 5}
-                textAnchor="middle"
-                fill="white"
-                fontSize="20"
-                fontWeight="bold"
-              >
-                Node A
-              </text>
-              <text
-                x={nodeCoords.A.x}
-                y={nodeCoords.A.y + 15}
-                textAnchor="middle"
-                fill="white"
-                fontSize="11"
-                fontWeight="600"
-              >
-                {getNodeState('A')}
-              </text>
-              {/* A status dot */}
-              <circle
-                cx={nodeCoords.A.x + 45}
-                cy={nodeCoords.A.y - 45}
-                r={6}
-                fill={peerResponses.A?.success ? '#10b981' : '#ef4444'}
-                style={{
-                  filter: `drop-shadow(0 0 8px ${peerResponses.A?.success
-                      ? 'rgba(16, 185, 129, 0.8)'
-                      : 'rgba(239, 68, 68, 0.8)'
-                    })`,
-                }}
-              />
+              {/* Nodes A, B, C */}
+              {['A', 'B', 'C'].map((nodeId) => {
+                const isLeader = leaderId === nodeId;
+                const color = isLeader ? nodeColors.leader : nodeColors.follower;
+                const coords = nodeCoords[nodeId];
 
-              {/* Node B */}
-              <circle
-                cx={nodeCoords.B.x}
-                cy={nodeCoords.B.y}
-                r={50}
-                fill={
-                  nodeColors[
-                    leaderId === 'B' ? 'leader' : 'follower'
-                  ].gradient
-                }
-                style={{
-                  filter: `drop-shadow(0 4px 12px ${nodeColors[
-                      leaderId === 'B' ? 'leader' : 'follower'
-                    ].shadow
-                    })`,
-                }}
-              />
-              <text
-                x={nodeCoords.B.x}
-                y={nodeCoords.B.y - 5}
-                textAnchor="middle"
-                fill="white"
-                fontSize="20"
-                fontWeight="bold"
-              >
-                Node B
-              </text>
-              <text
-                x={nodeCoords.B.x}
-                y={nodeCoords.B.y + 15}
-                textAnchor="middle"
-                fill="white"
-                fontSize="11"
-                fontWeight="600"
-              >
-                {getNodeState('B')}
-              </text>
-              {/* B status dot */}
-              <circle
-                cx={nodeCoords.B.x + 45}
-                cy={nodeCoords.B.y - 45}
-                r={6}
-                fill={peerResponses.B?.success ? '#10b981' : '#ef4444'}
-                style={{
-                  filter: `drop-shadow(0 0 8px ${peerResponses.B?.success
-                      ? 'rgba(16, 185, 129, 0.8)'
-                      : 'rgba(239, 68, 68, 0.8)'
-                    })`,
-                }}
-              />
-
-              {/* Node C */}
-              <circle
-                cx={nodeCoords.C.x}
-                cy={nodeCoords.C.y}
-                r={50}
-                fill={
-                  nodeColors[
-                    leaderId === 'C' ? 'leader' : 'follower'
-                  ].gradient
-                }
-                style={{
-                  filter: `drop-shadow(0 4px 12px ${nodeColors[
-                      leaderId === 'C' ? 'leader' : 'follower'
-                    ].shadow
-                    })`,
-                }}
-              />
-              <text
-                x={nodeCoords.C.x}
-                y={nodeCoords.C.y - 5}
-                textAnchor="middle"
-                fill="white"
-                fontSize="20"
-                fontWeight="bold"
-              >
-                Node C
-              </text>
-              <text
-                x={nodeCoords.C.x}
-                y={nodeCoords.C.y + 15}
-                textAnchor="middle"
-                fill="white"
-                fontSize="11"
-                fontWeight="600"
-              >
-                {getNodeState('C')}
-              </text>
-              {/* C status dot */}
-              <circle
-                cx={nodeCoords.C.x + 45}
-                cy={nodeCoords.C.y - 45}
-                r={6}
-                fill={peerResponses.C?.success ? '#10b981' : '#ef4444'}
-                style={{
-                  filter: `drop-shadow(0 0 8px ${peerResponses.C?.success
-                      ? 'rgba(16, 185, 129, 0.8)'
-                      : 'rgba(239, 68, 68, 0.8)'
-                    })`,
-                }}
-              />
+                return (
+                  <g key={`node-${nodeId}`}>
+                    <circle
+                      cx={coords.x}
+                      cy={coords.y}
+                      r={50}
+                      fill={color.gradient}
+                      style={{
+                        filter: `drop-shadow(0 4px 12px ${color.shadow})`,
+                      }}
+                    />
+                    <text
+                      x={coords.x}
+                      y={coords.y - 5}
+                      textAnchor="middle"
+                      fill="white"
+                      fontSize="20"
+                      fontWeight="bold"
+                    >
+                      Node {nodeId}
+                    </text>
+                    <text
+                      x={coords.x}
+                      y={coords.y + 15}
+                      textAnchor="middle"
+                      fill="white"
+                      fontSize="11"
+                      fontWeight="600"
+                    >
+                      {getNodeState(nodeId)}
+                    </text>
+                  </g>
+                );
+              })}
             </svg>
           </div>
 
@@ -892,7 +1015,7 @@ const RaftVisualizationWithWebSocket = () => {
         >
           {['A', 'B', 'C'].map((nodeId) => (
             <div
-              key={nodeId}
+              key={`log-${nodeId}`}
               style={{
                 background: 'rgba(30, 41, 59, 0.8)',
                 border: '1px solid rgba(71, 85, 105, 0.4)',
@@ -924,7 +1047,7 @@ const RaftVisualizationWithWebSocket = () => {
                   maxHeight: '400px',
                 }}
               >
-                {nodeLogEntries[nodeId].length === 0 ? (
+                {nodeLogEntries[nodeId] && nodeLogEntries[nodeId].length === 0 ? (
                   <div
                     style={{
                       color: '#64748b',
@@ -934,10 +1057,10 @@ const RaftVisualizationWithWebSocket = () => {
                   >
                     No entries yet...
                   </div>
-                ) : (
-                  nodeLogEntries[nodeId].map((log) => (
+                ) : nodeLogEntries[nodeId] ? (
+                  nodeLogEntries[nodeId].map((log, idx) => (
                     <motion.div
-                      key={log.id}
+                      key={`${nodeId}-log-${log.id}-${idx}`}
                       initial={{ opacity: 0, x: -20 }}
                       animate={{ opacity: 1, x: 0 }}
                       transition={{ duration: 0.4 }}
@@ -956,132 +1079,28 @@ const RaftVisualizationWithWebSocket = () => {
                         display: 'flex',
                         justifyContent: 'space-between',
                         alignItems: 'center',
+                        wordBreak: 'break-word',
                       }}
                     >
-                      <span style={{ flex: 1, wordBreak: 'break-all' }}>
-                        {log.value}
+                      <span style={{ flex: 1 }}>
+                        {log.value || 'Empty entry'}
                       </span>
                       {log.committed && (
-                        <span
-                          style={{ fontSize: '9px', whiteSpace: 'nowrap' }}
-                        >
+                        <span style={{ fontSize: '9px', marginLeft: '0.5rem', whiteSpace: 'nowrap' }}>
                           ✓
                         </span>
                       )}
                     </motion.div>
                   ))
-                )}
+                ) : null}
               </div>
             </div>
           ))}
         </div>
       </div>
 
-      {/* Committed KV Store */}
-      <div
-        style={{
-          background: 'rgba(30, 41, 59, 0.8)',
-          border: '1px solid rgba(71, 85, 105, 0.4)',
-          borderRadius: '12px',
-          padding: '1.5rem',
-          backdropFilter: 'blur(10px)',
-          marginBottom: '2rem',
-        }}
-      >
-        <h2
-          style={{
-            fontSize: '1.2rem',
-            fontWeight: '700',
-            margin: '0 0 1rem 0',
-            color: '#10b981',
-          }}
-        >
-          Committed KV Store (State Machine)
-        </h2>
-        {Object.keys(committedKVStore).length === 0 ? (
-          <div
-            style={{
-              color: '#64748b',
-              fontSize: '12px',
-              fontStyle: 'italic',
-              padding: '1rem',
-            }}
-          >
-            No committed entries yet...
-          </div>
-        ) : (
-          <div style={{ overflowX: 'auto' }}>
-            <table
-              style={{
-                width: '100%',
-                borderCollapse: 'collapse',
-                fontSize: '12px',
-              }}
-            >
-              <thead>
-                <tr
-                  style={{
-                    borderBottom: '2px solid rgba(16, 185, 129, 0.3)',
-                  }}
-                >
-                  <th
-                    style={{
-                      padding: '0.75rem',
-                      textAlign: 'left',
-                      color: '#10b981',
-                      fontWeight: '700',
-                    }}
-                  >
-                    Key
-                  </th>
-                  <th
-                    style={{
-                      padding: '0.75rem',
-                      textAlign: 'left',
-                      color: '#10b981',
-                      fontWeight: '700',
-                    }}
-                  >
-                    Value
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                {Object.entries(committedKVStore).map(([key, value]) => (
-                  <motion.tr
-                    key={key}
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    transition={{ duration: 0.5 }}
-                    style={{
-                      borderBottom: '1px solid rgba(71, 85, 105, 0.3)',
-                    }}
-                  >
-                    <td
-                      style={{
-                        padding: '0.75rem',
-                        color: '#cbd5e1',
-                        fontFamily: 'monospace',
-                      }}
-                    >
-                      {key}
-                    </td>
-                    <td
-                      style={{
-                        padding: '0.75rem',
-                        color: '#10b981',
-                        fontFamily: 'monospace',
-                      }}
-                    >
-                      {String(value)}
-                    </td>
-                  </motion.tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
+      {/* Committed KV Store (State Machine) - 3 columns: Key, Field, Value */}
+      {enhancedTableUI}
 
       {/* Legend */}
       <div
@@ -1108,8 +1127,7 @@ const RaftVisualizationWithWebSocket = () => {
               width: '12px',
               height: '12px',
               borderRadius: '50%',
-              background:
-                'linear-gradient(135deg, #f97316, #ef4444)',
+              background: 'linear-gradient(135deg, #f97316, #ef4444)',
             }}
           />
           Leader Node
@@ -1127,8 +1145,7 @@ const RaftVisualizationWithWebSocket = () => {
               width: '12px',
               height: '12px',
               borderRadius: '50%',
-              background:
-                'linear-gradient(135deg, #3b82f6, #06b6d4)',
+              background: 'linear-gradient(135deg, #3b82f6, #06b6d4)',
             }}
           />
           Follower Node
@@ -1141,9 +1158,7 @@ const RaftVisualizationWithWebSocket = () => {
             color: '#cbd5e1',
           }}
         >
-          <div
-            style={{ width: '12px', height: '2px', background: '#06b6d4' }}
-          />
+          <div style={{ width: '12px', height: '2px', background: '#06b6d4' }} />
           Heartbeat (Cyan)
         </div>
         <div
@@ -1154,9 +1169,7 @@ const RaftVisualizationWithWebSocket = () => {
             color: '#cbd5e1',
           }}
         >
-          <div
-            style={{ width: '12px', height: '2px', background: '#10b981' }}
-          />
+          <div style={{ width: '12px', height: '2px', background: '#10b981' }} />
           Peer Response (Green)
         </div>
       </div>

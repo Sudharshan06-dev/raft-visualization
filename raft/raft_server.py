@@ -7,6 +7,7 @@ import random
 from raft.raft_websocket_manager import WebSocketManager
 import asyncio
 import concurrent.futures
+import traceback
 import datetime
 import json
 import threading
@@ -184,11 +185,35 @@ class Raft(IRaftActions):
             
                 # Rule 3: Persist to disk immediately (required by Raft)
                 self._persist_log_entry(log_entry)
-                                
+                
+                #Rule 4: Send the heartbeat to the UI saying that the leader has written the data
                 print(f"[Node {self.raft_terms.id}] Appended log entry at index {log_index}")
                 
+            try:
+                print(f"[Node {self.raft_terms.id}] Leader Broadcasting to the UI...")
                 
-
+                # ← FIX: Get the loop from WebSocketManager (which has the running loop)
+                loop = self.ws_manager.event_loop
+                
+                if loop is None:
+                    print(f"[Node {self.raft_terms.id}] ERROR: WebSocketManager event_loop not initialized!")
+                    return
+                
+                if not loop.is_running():
+                    print(f"[Node {self.raft_terms.id}] ERROR: Event loop is not running!")
+                    return
+                
+                # Now schedule the coroutine on the running loop
+                asyncio.run_coroutine_threadsafe(
+                    self.ws_manager.broadcast_log_entry(
+                        node_id=self.raft_terms.id,
+                        log_entry=log_entry["command"],
+                        log_index=self.raft_terms.last_log_index,
+                    ),
+                    loop,
+                )
+                print(f"[Node {self.raft_terms.id}] Coroutine scheduled on event loop")
+                
                 # Rule 4: Return to client
                 # Client can:
                 # - Poll to check if committed
@@ -198,6 +223,15 @@ class Raft(IRaftActions):
                     "index": log_index,
                     "term": self.raft_terms.current_term,
                     "message": "Appended to leader log, waiting for replication"
+                }
+        
+            except Exception as e:
+                print(f"[Node {self.raft_terms.id}] WebSocket broadcast error: {e}")
+                traceback.print_exc()  # Print full traceback for debugging
+                return {
+                    "success": False,
+                    "error": "WEBSOCKET_ERROR",
+                    "message": str(e)
                 }
                 
         except Exception as e:
@@ -530,7 +564,6 @@ class Raft(IRaftActions):
             
         except Exception as e:
             print(f"[Node {self.raft_terms.id}] WebSocket broadcast error: {e}")
-            import traceback
             traceback.print_exc()  # Print full traceback for debugging
             
         # Send to all peers IN PARALLEL
@@ -600,7 +633,7 @@ class Raft(IRaftActions):
                 self.raft_terms.logs = self.raft_terms.logs[:insert_index]
                 self._truncate_log_file(insert_index)  
                 
-                for entry_ref in health_check_arguments.entries:
+                for i, entry_ref in enumerate(health_check_arguments.entries):
                     if isinstance(entry_ref, dict):
                         plain_entry = entry_ref
                     else:
@@ -614,6 +647,24 @@ class Raft(IRaftActions):
                     
                     #Persist to disk immediately (RAFT requirement)
                     self._persist_log_entry(clean_entry)
+                    
+                    # Calculate the log index for this entry
+                    log_idx = health_check_arguments.prev_log_index + i + 1
+                    
+                    # Broadcast immediately (so UI shows entry as soon as appended) -> followers
+                    try:
+                        loop = self.ws_manager.event_loop
+                        if loop and loop.is_running():
+                            asyncio.run_coroutine_threadsafe(
+                                self.ws_manager.broadcast_log_entry(
+                                    node_id=self.raft_terms.id,
+                                    log_entry=clean_entry["command"],
+                                    log_index=log_idx,
+                                ),
+                                loop,
+                            )
+                    except Exception as e:
+                        print(f"[Node {self.raft_terms.id}] Broadcast error: {e}")
                 
                 # Update metadata
                 if self.raft_terms.logs:
@@ -631,6 +682,23 @@ class Raft(IRaftActions):
                     len(self.raft_terms.logs) - 1
                 )
                 self._persist_state()
+                
+                # Broadcast that entries are now committed to the followers
+                try:
+                    loop = self.ws_manager.event_loop
+                    if loop and loop.is_running():
+                        asyncio.run_coroutine_threadsafe(
+                            self.ws_manager.broadcast_entries_committed(
+                                node_id=self.raft_terms.id,
+                                committed_until_index= self.raft_terms.commit_index,
+                                current_term=self.raft_terms.current_term,
+                            ),
+                            loop,
+                        )
+                        print(f"[Node {self.raft_terms.id}] Broadcast: Entries committed up to index { self.raft_terms.commit_index}")
+                except Exception as e:
+                    print(f"[Node {self.raft_terms.id}] Error broadcasting: {e}")
+                    
                 print(f"[Node {self.raft_terms.id}] Updated commitIndex: {old_commit} -> {self.raft_terms.commit_index}")
                 # Apply newly committed entries to state machine
                 self._apply_committed_entries()
@@ -652,6 +720,24 @@ class Raft(IRaftActions):
             if self.state_machine_applier:
                 try:
                     result = self.state_machine_applier.apply(log_entry["command"])
+                    
+                    # Broadcast that entry was applied
+                    try:
+                        loop = self.ws_manager.event_loop
+                        if loop and loop.is_running():
+                            asyncio.run_coroutine_threadsafe(
+                                self.ws_manager.broadcast_kv_store_update(
+                                    node_id=self.raft_terms.id,
+                                    log_index=self.raft_terms.last_applied,
+                                    log_entry=log_entry,
+                                    result=result,
+                                ),
+                                loop,
+                            )
+                            print(f"[Node {self.raft_terms.id}] Broadcast: KV store updated")
+                    except Exception as e:
+                        print(f"[Node {self.raft_terms.id}] Error broadcasting: {e}")
+                    
                     print(f"[Node {self.raft_terms.id}] State machine apply result: {result}")
                 except Exception as e:
                     print(f"[Node {self.raft_terms.id}] Error applying to state machine: {e}")
@@ -837,8 +923,25 @@ class Raft(IRaftActions):
             if replicated_count >= majority and self.raft_terms.logs[index].get("term") == self.raft_terms.current_term:
                 old_commit = self.raft_terms.commit_index
                 self.raft_terms.commit_index = index
-                print(f"[Node {self.raft_terms.id}] Advanced commitIndex: {old_commit} -> {index}")
                 
+                # Broadcast that entries are now committed
+                try:
+                    loop = self.ws_manager.event_loop
+                    if loop and loop.is_running():
+                        asyncio.run_coroutine_threadsafe(
+                            self.ws_manager.broadcast_entries_committed(
+                                node_id=self.raft_terms.id,
+                                committed_until_index=index,
+                                current_term=self.raft_terms.current_term,
+                            ),
+                            loop,
+                        )
+                        print(f"[Node {self.raft_terms.id}] Broadcast: Entries committed up to index {index}")
+                except Exception as e:
+                    print(f"[Node {self.raft_terms.id}] Error broadcasting: {e}")
+                    
+                print(f"[Node {self.raft_terms.id}] Advanced commitIndex: {old_commit} -> {index}")
+            
                 # Apply newly committed entries
                 self._apply_committed_entries()
                 
