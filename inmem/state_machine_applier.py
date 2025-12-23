@@ -31,6 +31,19 @@ class StateMachineApplier:
                 "error": f"Failed to apply command: {e}"
             }
     
+    def get_state(self):
+        try:
+            return {
+                "success": True,
+                "data": self.db.get_entire_data()
+            }
+        
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Failed to apply command: {e}"
+            }
+    
     def _apply_set(self, command: Dict[str, Any]) -> Dict[str, Any]:
         """Apply SET command."""
         self.db.set_at(

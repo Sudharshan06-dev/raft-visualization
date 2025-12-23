@@ -1,4 +1,4 @@
-# raft/raft_websocket_manager.py - FIXED VERSION
+# raft/raft_websocket_manager.py
 
 import json
 import threading
@@ -13,7 +13,8 @@ class WebSocketManager:
     def __init__(self):
         self.clients: set[WebSocket] = set()
         self.lock = threading.Lock()
-        self.event_loop: asyncio.AbstractEventLoop | None = None  # ← FIX: Store the running loop
+        self.event_loop: asyncio.AbstractEventLoop | None = None
+        self.raft_server = None  # Reference to RAFT server
         print("WebSocketManager initialized")
 
     @classmethod
@@ -22,12 +23,25 @@ class WebSocketManager:
             cls._instance = WebSocketManager()
         return cls._instance
 
+    def register_node(self, node_id: str, raft_server):
+        """Register a RAFT node"""
+        if not hasattr(self, 'raft_nodes'):
+            self.raft_nodes = {}
+        self.raft_nodes[node_id] = raft_server
+        print(f"[WebSocketManager] Node {node_id} registered")
+        
+    
+    def get_registered_nodes(self):
+        """Get all registered nodes"""
+        return getattr(self, 'raft_nodes', {})
+
     def set_event_loop(self, loop: asyncio.AbstractEventLoop):
         """CRITICAL: Call this from the running FastAPI thread to register the loop"""
         self.event_loop = loop
         print(f"WebSocketManager event loop set: {id(loop)}")
 
     def _make_serializable(self, obj):
+        """Convert objects to JSON-serializable format"""
         if obj is None:
             return None
         if isinstance(obj, (bool, int, float, str)):
@@ -47,15 +61,78 @@ class WebSocketManager:
         except Exception:
             return "unknown"
 
+    async def on_client_connect(self):
+        """
+        Called when a browser connects via WebSocket.
+        Syncs current RAFT state to the new client.
+        """
+        raft_nodes = self.get_registered_nodes()
+        
+        if not raft_nodes:
+            print("[WebSocketManager] Warning: No RAFT nodes registered")
+            return
+        
+        try:
+            print(f"[WebSocketManager] Syncing state for {len(raft_nodes)} nodes...")
+            
+            # Sync state from ALL nodes
+            for node_id, raft_server in raft_nodes.items():
+                try:
+                    with raft_server.lock:
+                        logs = raft_server.raft_terms.logs
+                        commit_index = raft_server.raft_terms.commit_index
+                    
+                    # Send log entries for this node
+                    for index, log_entry in enumerate(logs):
+                        is_committed = index <= commit_index
+                        await self.broadcast_log_entry(
+                            node_id=node_id,
+                            log_entry=log_entry.get("command", ""),
+                            log_index=index,
+                            committed=is_committed,
+                        )
+                
+                except Exception as e:
+                    print(f"[WebSocketManager] Error syncing node {node_id}: {e}")
+        
+            
+                try:
+                    if raft_server.state_machine_applier:
+                        state_machine_data = raft_server.state_machine_applier.get_state()
+                        state_machine_data = state_machine_data.get('data', None)
+                        
+                        if state_machine_data:
+                            print(f"[WebSocketManager] Sending KV store state to client...")
+                            for key, byte_data_record in state_machine_data.items():
+                                # Access fields from ByteDataRecord
+                                for field_name, field_obj in byte_data_record.fields.items():
+                                    await self.broadcast_kv_store_update(
+                                        node_id=node_id,
+                                        log_index=-1,
+                                        log_entry={"command": f"SET {key}.{field_name}={field_obj.value}"},
+                                        result={"key": key, "field": field_name, "value": field_obj.value},
+                                    )
+                except Exception as e:
+                    print(f"[WebSocketManager] Error syncing KV store: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            print(f"[WebSocketManager] State sync complete for client")
+        
+        except Exception as e:
+            print(f"[WebSocketManager] Error during state sync: {e}")
+            import traceback
+            traceback.print_exc()
+
     async def add_client(self, websocket: WebSocket):
         with self.lock:
             self.clients.add(websocket)
-            print(f"Client connected. Total clients: {len(self.clients)}")
+            print(f"[WebSocketManager] Client connected. Total clients: {len(self.clients)}")
 
     async def remove_client(self, websocket: WebSocket):
         with self.lock:
             self.clients.discard(websocket)
-            print(f"Client disconnected. Total clients: {len(self.clients)}")
+            print(f"[WebSocketManager] Client disconnected. Total clients: {len(self.clients)}")
 
     async def broadcast_heartbeat(
         self,
@@ -66,8 +143,7 @@ class WebSocketManager:
         followers: List[str],
         peer_responses: Dict | None = None,
     ):
-        
-        print("broadcast_heartbeat EXECUTING")  # Debug: Confirm execution
+        print("broadcast_heartbeat EXECUTING")
         if peer_responses is None:
             peer_responses = {}
 

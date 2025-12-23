@@ -20,7 +20,7 @@ WEBSOCKET_PORT = 8765
 
 
 class RaftCluster:
-    def __init__(self, config, ws_manager):
+    def __init__(self, config, ws_manager: WebSocketManager):
         self.config = config
         self.servers = {}
         self.nodes = {}
@@ -80,12 +80,13 @@ class RaftCluster:
         print("\n[Cluster] All RPC servers started. Waiting for stabilization...")
         time.sleep(1)
 
-        print("\n" + "=" * 60)
+        # Register one RAFT server with WebSocketManager
+        # This allows on_client_connect() to access RAFT state
         print("RAFT Cluster Startup - Phase 2: Begin Leader Election")
-        print("=" * 60)
 
         for node_id, node in self.nodes.items():
             print(f"[Cluster] Starting election timer for Node {node_id}")
+            self.ws_manager.register_node(node_id, node)
             node.start_raft_node()
 
         print("\n[Cluster] All nodes ready for leader election!")

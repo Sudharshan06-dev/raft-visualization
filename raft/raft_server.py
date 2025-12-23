@@ -56,6 +56,9 @@ class Raft(IRaftActions):
         # Load persistent state from disk if it exists - what if the server has crashed and it has restarted
         self._load_persistent_state()
         
+        #Recover in-memory state machine after loading persistent state
+        self._recover_state_machine_from_log()
+        
         # ADDED: For leader log tracking
         self.next_index = {}        # Index of next log entry to send to each peer
         self.match_index = {}       # Index of highest replicated log entry on each peer
@@ -1110,6 +1113,59 @@ class Raft(IRaftActions):
         except Exception as e:
             print(f"[Node {self.raft_terms.id}] Error persisting state: {e}")
     
+    def _recover_state_machine_from_log(self):
+        """
+        RECOVERY METHOD: Called during startup to rebuild in-memory state machine
+        by replaying all committed entries from the persistent log.
+        
+        This ensures that after a node crash/restart, the KV store is populated
+        with all data that was committed before the crash.
+        
+        Raft Paper: State machine is deterministic, so replaying the same entries
+        in the same order always produces the same state.
+        """
+        
+        with self.lock:
+            print(f"[Node {self.raft_terms.id}] Rebuilding state machine from committed log entries...")
+            print(f"[Node {self.raft_terms.id}] Loaded state: commit_index={self.raft_terms.commit_index}, last_applied={self.raft_terms.last_applied}")
+            
+            # Safety check: commit_index should never be less than last_applied
+            if self.raft_terms.commit_index < self.raft_terms.last_applied:
+                print(f"[Node {self.raft_terms.id}] WARN: commit_index < last_applied (corruption?)")
+                self.raft_terms.last_applied = self.raft_terms.commit_index
+            
+            # Replay all committed entries
+            entries_replayed = 0
+            
+            # Don't skip any - the in-memory state machine is empty and needs to be rebuilt
+            # The last_applied value from disk is just metadata; we need to rebuild the state machine
+            
+            for index in range(0, self.raft_terms.commit_index + 1):
+                # Bounds check
+                if index >= len(self.raft_terms.logs):
+                    print(f"[Node {self.raft_terms.id}] WARN: commit_index ({self.raft_terms.commit_index}) exceeds log length ({len(self.raft_terms.logs)})")
+                    break
+                
+                log_entry = self.raft_terms.logs[index]
+                
+                # Apply this entry to state machine
+                # We must rebuild the entire state machine
+                if self.state_machine_applier and log_entry and "command" in log_entry:
+                    try:
+                        self.state_machine_applier.apply(log_entry["command"])
+                        self.raft_terms.last_applied = index
+                        entries_replayed += 1
+                        
+                        print(f"[Node {self.raft_terms.id}] Replayed entry {index}: {log_entry['command'][:60]}...")
+                        
+                    except Exception as e:
+                        print(f"[Node {self.raft_terms.id}] Error replaying entry {index}: {e}")
+                        import traceback
+                        traceback.print_exc()
+            
+            print(f"[Node {self.raft_terms.id}] Recovery complete: {entries_replayed} entries replayed")
+            print(f"[Node {self.raft_terms.id}] State machine state: last_applied={self.raft_terms.last_applied}, commit_index={self.raft_terms.commit_index}")
+                    
     def _load_persistent_state(self):
         """
         Load persistent state from TWO separate files:

@@ -58,6 +58,9 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     await ws_manager.add_client(websocket)
     print(f"WebSocket client connected. Total clients: {ws_manager.get_client_count()}")
+    
+    #Sync state immediately when client connects
+    await ws_manager.on_client_connect()
 
     try:
         while True:
