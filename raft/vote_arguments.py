@@ -8,7 +8,7 @@ class VoteArguments:
     
     Sent by candidates during leader election (§5.2)
     """
-    current_term: int      # Candidate's current term
     candidate_id: int      # Candidate requesting vote
+    current_term: int      # Candidate's current term
     last_log_index: int    # Index of candidate's last log entry (§5.4)
     last_log_term: int     # Term of candidate's last log entry (§5.4)

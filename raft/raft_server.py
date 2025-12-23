@@ -116,7 +116,7 @@ class Raft(IRaftActions):
             # 3. Wait using event.wait(timeout)
             # it returns TRUE if set() was called -> if the health check function is reached before the timeout then the set is invoked
             # by another thread, or FALSE if the timeout was reached naturally.
-            election_timeout_invoked = self.election_timer_event.wait(timeout=self.raft_terms.election_timer)
+            heartbeat_received = self.election_timer_event.wait(timeout=self.raft_terms.election_timer)
             
             #Before asking for the vote check if the node is active
             #Checking the worst scenarios first
@@ -125,7 +125,7 @@ class Raft(IRaftActions):
             
             #Check if the leader invokes the health check up
             #If the events occurs then we have to again reset the timer for the election timeout
-            if election_timeout_invoked:
+            if heartbeat_received:
                 print(f"[Node {self.raft_terms.id}] Election timeout received, resetting timer")
                 continue
             
@@ -362,16 +362,49 @@ class Raft(IRaftActions):
             # Step 4: Persist state BEFORE sending RPCs
             self._persist_state()
             
+            #Reset election timer when becoming candidate
+            self.reset_election_timer()
+        
             # Prepare RequestVote arguments
             vote_arguments = VoteArguments(
-                current_term=self.raft_terms.current_term,
                 candidate_id=self.raft_terms.id,
+                current_term=self.raft_terms.current_term,
                 last_log_index=self.raft_terms.last_log_index,
                 last_log_term=self.raft_terms.last_log_term
             )
             
             # Get peers snapshot
             peers = dict(self.raft_terms.peers)
+        
+        try:
+            print(f"[Node {self.raft_terms.id}] Broadcasting leader election vote request to UI...")
+            
+            # ← FIX: Get the loop from WebSocketManager (which has the running loop)
+            loop = self.ws_manager.event_loop
+            
+            if loop is None:
+                print(f"[Node {self.raft_terms.id}] ERROR: WebSocketManager event_loop not initialized!")
+                return
+            
+            if not loop.is_running():
+                print(f"[Node {self.raft_terms.id}] ERROR: Event loop is not running!")
+                return
+            
+            # Now schedule the coroutine on the running loop
+            asyncio.run_coroutine_threadsafe(
+                self.ws_manager.broadcast_vote_request(
+                    node_id=self.raft_terms.id,
+                    current_term=self.raft_terms.current_term,
+                    last_log_index=self.raft_terms.last_log_index,
+                    last_log_term=self.raft_terms.last_log_term,
+                ),
+                loop,
+            )
+            print(f"[Node {self.raft_terms.id}] Coroutine scheduled on event loop for leader election")
+            
+        except Exception as e:
+            print(f"[Node {self.raft_terms.id}] WebSocket broadcast error: {e}")
+            traceback.print_exc()  # Print full traceback for debugging
     
         # Step 5: Send RequestVote RPCs in PARALLEL
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(peers)) as executor:
@@ -411,7 +444,26 @@ class Raft(IRaftActions):
                 self.match_index[self.raft_terms.id] = len(self.raft_terms.logs) - 1
                 
                 won_election = True  # ← Set flag
-    
+
+        # Broadcast that entries are now committed to the followers
+        try:
+            loop = self.ws_manager.event_loop
+            if loop and loop.is_running():
+                asyncio.run_coroutine_threadsafe(
+                    self.ws_manager.broadcast_election_result(
+                        node_id=self.raft_terms.id,
+                        election_result=won_election,
+                        voted_by=list(self.received_votes.keys()),
+                        current_term = self.raft_terms.current_term,
+                        last_log_index= vote_arguments.last_log_index,
+                        last_log_term = vote_arguments.last_log_term,
+                    ),
+                    loop,
+                )
+                print(f"[Node {self.raft_terms.id}] Broadcast: Election result { self.raft_terms.commit_index}")
+        except Exception as e:
+            print(f"[Node {self.raft_terms.id}] Error broadcasting: {e}")
+            
         # Step 8: Send immediate heartbeat OUTSIDE the lock
         if won_election:
             print(f"[Node {self.raft_terms.id}] Sending immediate heartbeat to establish leadership")
@@ -466,9 +518,47 @@ class Raft(IRaftActions):
                 self._persist_state()  # Persist vote before responding
                 self.reset_election_timer()  # Reset our own election timeout
                 print(f"[Node {self.raft_terms.id}] GRANTED vote to Node {vote_arguments.candidate_id}")
+                
+                # Broadcast vote response from follwers to leader
+                try:
+                    loop = self.ws_manager.event_loop
+                    if loop and loop.is_running():
+                        asyncio.run_coroutine_threadsafe(
+                            self.ws_manager.broadcast_vote_response(
+                                node_id=self.raft_terms.id,
+                                voted_for = vote_arguments.candidate_id,
+                                current_term = self.raft_terms.current_term,
+                                last_log_index= vote_arguments.last_log_index,
+                                last_log_term = vote_arguments.last_log_term,
+                            ),
+                            loop,
+                        )
+                        print(f"[Node {self.raft_terms.id}] Broadcast voted for  {vote_arguments.candidate_id}")
+                except Exception as e:
+                    print(f"[Node {self.raft_terms.id}] Error broadcasting: {e}")
+                    
                 return True
             else:
                 print(f"[Node {self.raft_terms.id}] REJECTED vote (can_vote={can_vote}, log_current={log_is_current})")
+                
+                # Broadcast vote response from follwers to leader
+                try:
+                    loop = self.ws_manager.event_loop
+                    if loop and loop.is_running():
+                        asyncio.run_coroutine_threadsafe(
+                            self.ws_manager.broadcast_vote_response(
+                                node_id=self.raft_terms.id,
+                                voted_for = -1,
+                                current_term = self.raft_terms.current_term,
+                                last_log_index= vote_arguments.last_log_index,
+                                last_log_term = vote_arguments.last_log_term,
+                            ),
+                            loop,
+                        )
+                        print(f"[Node {self.raft_terms.id}] Broadcast: reject vote for { vote_arguments.candidate_id}")
+                except Exception as e:
+                    print(f"[Node {self.raft_terms.id}] Error broadcasting: {e}")
+                    
                 return False
     
     # -----------------------------

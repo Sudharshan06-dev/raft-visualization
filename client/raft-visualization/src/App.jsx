@@ -12,18 +12,18 @@ const RaftVisualizationWithWebSocket = () => {
   const [inputField, setInputField] = useState('');
   const [inputValue, setInputValue] = useState('');
 
-  // Logs per node, driven entirely by backend
+  // Logs per node
   const [nodeLogEntries, setNodeLogEntries] = useState({
     A: [],
     B: [],
     C: [],
   });
 
-  // KV store with key -> field -> value structure
-  // Structure: { key1: { field1: value1, field2: value2 }, key2: { fieldA: valueA } }
+  // KV store
   const [kvMetadata, setKvMetadata] = useState({});
   const [committedKVStore, setCommittedKVStore] = useState({});
 
+  // Base RAFT state
   const [activeMessage, setActiveMessage] = useState(null);
   const [leaderId, setLeaderId] = useState(null);
   const [currentTerm, setCurrentTerm] = useState(null);
@@ -35,6 +35,15 @@ const RaftVisualizationWithWebSocket = () => {
   const [lastHeartbeatTime, setLastHeartbeatTime] = useState(null);
   const [debugMessages, setDebugMessages] = useState([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // NEW: Election state
+  const [electionInProgress, setElectionInProgress] = useState(false);
+  const [candidateNodes, setCandidateNodes] = useState([]); // ['A', 'B']
+  const [electionTerm, setElectionTerm] = useState(null);
+  const [voteRequests, setVoteRequests] = useState([]); // [{ from: 'A', to: 'B', id: '...' }]
+  const [votesReceived, setVotesReceived] = useState({}); // { 'A': ['B', 'C'], 'B': ['A'] }
+  const [electionWinner, setElectionWinner] = useState(null);
+  const [showElectionAnimation, setShowElectionAnimation] = useState(false);
 
   const wsRef = useRef(null);
 
@@ -113,6 +122,16 @@ const RaftVisualizationWithWebSocket = () => {
         case 'kv_store_update':
           handleKVStoreUpdate(message);
           break;
+        // NEW: Election message handlers
+        case 'vote_request':
+          handleVoteRequest(message);
+          break;
+        case 'vote_response':
+          handleVoteResponse(message);
+          break;
+        case 'election_result':
+          handleElectionResult(message);
+          break;
         default:
           addDebug(`⚠️ Unknown message type: ${message.type}`);
       }
@@ -138,7 +157,6 @@ const RaftVisualizationWithWebSocket = () => {
     setFollowers(Array.isArray(hbFollowers) ? hbFollowers : []);
     setLastHeartbeatTime(timestamp ? new Date(timestamp) : new Date());
 
-    // Reset peer responses for this heartbeat
     const newResponses = {};
     (hbFollowers || []).forEach((f) => {
       newResponses[f] = { success: null, term: null, matchIndex: null };
@@ -204,24 +222,19 @@ const RaftVisualizationWithWebSocket = () => {
           committed: !!committed,
         },
       ],
-
     }));
   };
-
-  // React component - Replace handleEntriesCommitted function
 
   const handleEntriesCommitted = (message) => {
     try {
       const { committed_until_index } = message;
       addDebug(`Entries committed up to index ${committed_until_index}`);
 
-      // UPDATE existing entries (don't create duplicates!)
       setNodeLogEntries((prev) => {
         const updated = {};
 
         ['A', 'B', 'C'].forEach((nId) => {
           updated[nId] = prev[nId].map((entry) => {
-            // Only update entries that exist and aren't already committed
             if (entry.id <= committed_until_index && !entry.committed) {
               return { ...entry, committed: true };
             }
@@ -232,7 +245,7 @@ const RaftVisualizationWithWebSocket = () => {
         return updated;
       });
     } catch (e) {
-      addDebug(` Error in handleEntriesCommitted: ${e.message}`);
+      addDebug(`Error in handleEntriesCommitted: ${e.message}`);
     }
   };
 
@@ -240,7 +253,6 @@ const RaftVisualizationWithWebSocket = () => {
     try {
       const { node_id, log_index, key, field, value, timestamp } = message;
 
-      // Validate all required fields
       if (!node_id || log_index == null) {
         addDebug(`KV update missing: node_id=${node_id}, log_index=${log_index}`);
         return;
@@ -251,10 +263,8 @@ const RaftVisualizationWithWebSocket = () => {
         return;
       }
 
-      // Create unique ID
       const updateId = `${node_id}-${log_index}-${key}-${field}`;
 
-      // Optional: Track processed updates
       setKvMetadata((prev) => ({
         ...prev,
         [`${key}-${field}`]: {
@@ -267,7 +277,6 @@ const RaftVisualizationWithWebSocket = () => {
 
       addDebug(`KV Store [Node ${node_id}]: ${key}.${field} = ${value}`);
 
-      // Update main data
       setCommittedKVStore((prev) => {
         const existing = prev[String(key)]?.[String(field)];
 
@@ -286,6 +295,90 @@ const RaftVisualizationWithWebSocket = () => {
     } catch (e) {
       addDebug(`KV store update error: ${e.message}`);
     }
+  };
+
+  // NEW: Election handlers
+  const handleVoteRequest = (message) => {
+    const { node_id, current_term, last_log_index, last_log_term } = message;
+
+    addDebug(`🗳️ Vote request from Node ${node_id} for term ${current_term}`);
+
+    // Mark node as candidate
+    setCandidateNodes((prev) => {
+      const set = new Set(prev);
+      set.add(node_id);
+      return Array.from(set);
+    });
+
+    setElectionInProgress(true);
+    setElectionTerm(current_term);
+
+    // Animate vote requests to all other nodes
+    const targetNodes = ['A', 'B', 'C'].filter((n) => n !== node_id);
+    const newRequests = targetNodes.map((target) => ({
+      from: node_id,
+      to: target,
+      id: `vreq-${node_id}-${target}-${Date.now()}`,
+    }));
+
+    setVoteRequests(newRequests);
+
+    // Clear animation after 1.5s
+    setTimeout(() => setVoteRequests([]), 1500);
+  };
+
+  const handleVoteResponse = (message) => {
+    const { node_id, voted_for, current_term } = message;
+
+    // -1 means rejected
+    if (voted_for === -1) {
+      addDebug(`❌ Node ${node_id} rejected vote in term ${current_term}`);
+      return;
+    }
+
+    addDebug(`✅ Node ${node_id} voted for Node ${voted_for} in term ${current_term}`);
+
+    // Track votes
+    setVotesReceived((prev) => ({
+      ...prev,
+      [voted_for]: [...(prev[voted_for] || []), node_id],
+    }));
+
+    // Animate response
+    setActiveMessage({
+      type: 'vote_response',
+      from: node_id,
+      to: voted_for,
+    });
+    setTimeout(() => setActiveMessage(null), 1000);
+  };
+
+  const handleElectionResult = (message) => {
+    const { node_id, election_result, current_term, voted_by } = message;
+
+    if (!election_result) {
+      addDebug(`⚠️ Node ${node_id} did not win election in term ${current_term}`);
+      return;
+    }
+
+    addDebug(`🎉 Node ${node_id} WON ELECTION in term ${current_term}!`);
+
+    // Update state
+    setElectionWinner(node_id);
+    setLeaderId(node_id);
+    setCurrentTerm(current_term);
+    setShowElectionAnimation(true);
+
+    // Clear candidates
+    setCandidateNodes([]);
+
+    // Clear election state after animation
+    setTimeout(() => {
+      setElectionInProgress(false);
+      setVotesReceived({});
+      setShowElectionAnimation(false);
+      setElectionWinner(null);
+    }, 2500);
   };
 
   const handleSubmitKVEntry = async () => {
@@ -321,8 +414,6 @@ const RaftVisualizationWithWebSocket = () => {
       }
 
       console.log('SET successful:', data);
-
-      // Clear inputs on success
       setInputKey('');
       setInputField('');
       setInputValue('');
@@ -335,11 +426,14 @@ const RaftVisualizationWithWebSocket = () => {
     }
   };
 
-
   const nodeColors = {
     leader: {
       gradient: 'linear-gradient(135deg, #f97316 0%, #ef4444 100%)',
       shadow: 'rgba(249, 115, 22, 0.5)',
+    },
+    candidate: {
+      gradient: 'linear-gradient(135deg, #a855f7 0%, #f59e0b 100%)',
+      shadow: 'rgba(168, 85, 247, 0.7)',
     },
     follower: {
       gradient: 'linear-gradient(135deg, #3b82f6 0%, #06b6d4 100%)',
@@ -347,12 +441,13 @@ const RaftVisualizationWithWebSocket = () => {
     },
   };
 
+  // Get node state: CANDIDATE > LEADER > FOLLOWER
   const getNodeState = (nodeId) => {
-    if (!leaderId) return 'FOLLOWER';
-    return nodeId === leaderId ? 'LEADER' : 'FOLLOWER';
+    if (candidateNodes.includes(nodeId)) return 'CANDIDATE';
+    if (leaderId === nodeId) return 'LEADER';
+    return 'FOLLOWER';
   };
 
-  // Enhanced: Get rows with metadata
   const getKVStoreRows = () => {
     const rows = [];
     Object.entries(committedKVStore).forEach(([key, fieldsObj]) => {
@@ -372,159 +467,157 @@ const RaftVisualizationWithWebSocket = () => {
     return rows;
   };
 
-  
-// Enhanced table with node and timestamp columns
-const enhancedTableUI = (
-  <div
-    style={{
-      background: 'rgba(30, 41, 59, 0.8)',
-      border: '1px solid rgba(71, 85, 105, 0.4)',
-      borderRadius: '12px',
-      padding: '1.5rem',
-      backdropFilter: 'blur(10px)',
-      marginBottom: '2rem',
-    }}
-  >
-    <h2
+  const enhancedTableUI = (
+    <div
       style={{
-        fontSize: '1.2rem',
-        fontWeight: '700',
-        margin: '0 0 1rem 0',
-        color: '#10b981',
+        background: 'rgba(30, 41, 59, 0.8)',
+        border: '1px solid rgba(71, 85, 105, 0.4)',
+        borderRadius: '12px',
+        padding: '1.5rem',
+        backdropFilter: 'blur(10px)',
+        marginBottom: '2rem',
       }}
     >
-      Committed KV Store (State Machine)
-    </h2>
-    {getKVStoreRows().length === 0 ? (
-      <div
+      <h2
         style={{
-          color: '#64748b',
-          fontSize: '12px',
-          fontStyle: 'italic',
-          padding: '1rem',
+          fontSize: '1.2rem',
+          fontWeight: '700',
+          margin: '0 0 1rem 0',
+          color: '#10b981',
         }}
       >
-        No committed entries yet...
-      </div>
-    ) : (
-      <div style={{ overflowX: 'auto' }}>
-        <table
+        Committed KV Store (State Machine)
+      </h2>
+      {getKVStoreRows().length === 0 ? (
+        <div
           style={{
-            width: '100%',
-            borderCollapse: 'collapse',
+            color: '#64748b',
             fontSize: '12px',
+            fontStyle: 'italic',
+            padding: '1rem',
           }}
         >
-          <thead>
-            <tr
-              style={{
-                borderBottom: '2px solid rgba(16, 185, 129, 0.3)',
-              }}
-            >
-              <th
+          No committed entries yet...
+        </div>
+      ) : (
+        <div style={{ overflowX: 'auto' }}>
+          <table
+            style={{
+              width: '100%',
+              borderCollapse: 'collapse',
+              fontSize: '12px',
+            }}
+          >
+            <thead>
+              <tr
                 style={{
-                  padding: '0.75rem',
-                  textAlign: 'left',
-                  color: '#10b981',
-                  fontWeight: '700',
-                  width: '20%',
+                  borderBottom: '2px solid rgba(16, 185, 129, 0.3)',
                 }}
               >
-                Key
-              </th>
-              <th
-                style={{
-                  padding: '0.75rem',
-                  textAlign: 'left',
-                  color: '#10b981',
-                  fontWeight: '700',
-                  width: '20%',
-                }}
-              >
-                Field
-              </th>
-              <th
-                style={{
-                  padding: '0.75rem',
-                  textAlign: 'left',
-                  color: '#10b981',
-                  fontWeight: '700',
-                  width: '30%',
-                }}
-              >
-                Value
-              </th>
-              <th
-                style={{
-                  padding: '0.75rem',
-                  textAlign: 'left',
-                  color: '#10b981',
-                  fontWeight: '700',
-                  width: '15%',
-                }}
-              >
-                Updated
-              </th>
-            </tr>
-          </thead>
-          <tbody>
-            {getKVStoreRows().map((row, idx) => (
-              <motion.tr
-                key={`kv-${row.key}-${row.field}-${idx}`}
-                initial={{ opacity: 0, y: -10 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ duration: 0.5 }}
-                style={{
-                  borderBottom: '1px solid rgba(71, 85, 105, 0.3)',
-                }}
-              >
-                <td
+                <th
                   style={{
                     padding: '0.75rem',
-                    color: '#cbd5e1',
-                    fontFamily: 'monospace',
-                    wordBreak: 'break-word',
-                  }}
-                >
-                  {String(row.key)}
-                </td>
-                <td
-                  style={{
-                    padding: '0.75rem',
-                    color: '#cbd5e1',
-                    fontFamily: 'monospace',
-                    wordBreak: 'break-word',
-                  }}
-                >
-                  {String(row.field)}
-                </td>
-                <td
-                  style={{
-                    padding: '0.75rem',
+                    textAlign: 'left',
                     color: '#10b981',
-                    fontFamily: 'monospace',
-                    wordBreak: 'break-word',
+                    fontWeight: '700',
+                    width: '20%',
                   }}
                 >
-                  {String(row.value)}
-                </td>
-                <td
+                  Key
+                </th>
+                <th
                   style={{
                     padding: '0.75rem',
-                    color: '#94a3b8',
-                    fontSize: '11px',
+                    textAlign: 'left',
+                    color: '#10b981',
+                    fontWeight: '700',
+                    width: '20%',
                   }}
                 >
-                  {row.updated_at}
-                </td>
-              </motion.tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    )}
-  </div>
-);
+                  Field
+                </th>
+                <th
+                  style={{
+                    padding: '0.75rem',
+                    textAlign: 'left',
+                    color: '#10b981',
+                    fontWeight: '700',
+                    width: '30%',
+                  }}
+                >
+                  Value
+                </th>
+                <th
+                  style={{
+                    padding: '0.75rem',
+                    textAlign: 'left',
+                    color: '#10b981',
+                    fontWeight: '700',
+                    width: '15%',
+                  }}
+                >
+                  Updated
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {getKVStoreRows().map((row, idx) => (
+                <motion.tr
+                  key={`kv-${row.key}-${row.field}-${idx}`}
+                  initial={{ opacity: 0, y: -10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ duration: 0.5 }}
+                  style={{
+                    borderBottom: '1px solid rgba(71, 85, 105, 0.3)',
+                  }}
+                >
+                  <td
+                    style={{
+                      padding: '0.75rem',
+                      color: '#cbd5e1',
+                      fontFamily: 'monospace',
+                      wordBreak: 'break-word',
+                    }}
+                  >
+                    {String(row.key)}
+                  </td>
+                  <td
+                    style={{
+                      padding: '0.75rem',
+                      color: '#cbd5e1',
+                      fontFamily: 'monospace',
+                      wordBreak: 'break-word',
+                    }}
+                  >
+                    {String(row.field)}
+                  </td>
+                  <td
+                    style={{
+                      padding: '0.75rem',
+                      color: '#10b981',
+                      fontFamily: 'monospace',
+                      wordBreak: 'break-word',
+                    }}
+                  >
+                    {String(row.value)}
+                  </td>
+                  <td
+                    style={{
+                      padding: '0.75rem',
+                      color: '#94a3b8',
+                      fontSize: '11px',
+                    }}
+                  >
+                    {row.updated_at}
+                  </td>
+                </motion.tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
 
   return (
     <div
@@ -540,26 +633,6 @@ const enhancedTableUI = (
         flexDirection: 'column',
       }}
     >
-      {/* Debug Panel */}
-      <div
-        style={{
-          position: 'fixed',
-          top: '10px',
-          right: '10px',
-          background: 'rgba(15, 23, 42, 0.95)',
-          border: '1px solid rgba(71, 85, 105, 0.5)',
-          borderRadius: '8px',
-          padding: '10px',
-          maxWidth: '300px',
-          fontSize: '10px',
-          color: '#cbd5e1',
-          zIndex: 1000,
-          maxHeight: '200px',
-          overflowY: 'auto',
-        }}
-      >
-      </div>
-
       {/* Header */}
       <div
         style={{
@@ -586,8 +659,7 @@ const enhancedTableUI = (
               fontSize: '0.95rem',
             }}
           >
-            Real-time distributed consensus with WebSocket heartbeats and peer
-            responses
+            Real-time leader election, heartbeats, and consensus
           </p>
         </div>
         <div
@@ -631,7 +703,119 @@ const enhancedTableUI = (
         </div>
       </div>
 
-      {/* Input KV Store - Updated for Key.Field = Value */}
+      {/* NEW: Election Tracker Panel */}
+      {electionInProgress && (
+        <motion.div
+          initial={{ opacity: 0, y: -20 }}
+          animate={{ opacity: 1, y: 0 }}
+          exit={{ opacity: 0, y: -20 }}
+          style={{
+            background: 'rgba(168, 85, 247, 0.1)',
+            border: '2px solid rgba(168, 85, 247, 0.6)',
+            borderRadius: '12px',
+            padding: '1.5rem',
+            marginBottom: '2rem',
+            backdropFilter: 'blur(10px)',
+          }}
+        >
+          <h2
+            style={{
+              fontSize: '1.2rem',
+              fontWeight: '700',
+              margin: '0 0 1rem 0',
+              color: '#a855f7',
+            }}
+          >
+            🗳️ Leader Election in Progress (Term {electionTerm})
+          </h2>
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+              gap: '1.5rem',
+            }}
+          >
+            {candidateNodes.map((candidate) => {
+              const votes = votesReceived[candidate] || [];
+              const total_nodes = 3;
+              const majority = Math.floor((total_nodes / 2) + 1);
+
+              return (
+                <div
+                  key={candidate}
+                  style={{
+                    background: 'rgba(15, 23, 42, 0.8)',
+                    border: '1px solid rgba(168, 85, 247, 0.4)',
+                    borderRadius: '10px',
+                    padding: '1.25rem',
+                  }}
+                >
+                  <div
+                    style={{
+                      color: '#a855f7',
+                      fontWeight: '800',
+                      fontSize: '1.2rem',
+                      marginBottom: '0.75rem',
+                    }}
+                  >
+                    Candidate {candidate}
+                  </div>
+
+                  {/* Vote progress bar */}
+                  <div style={{ marginBottom: '0.75rem' }}>
+                    <div
+                      style={{
+                        fontSize: '11px',
+                        color: '#cbd5e1',
+                        marginBottom: '0.4rem',
+                      }}
+                    >
+                      Votes: {votes.length}/{total_nodes} (Need {majority})
+                    </div>
+                    <div
+                      style={{
+                        width: '100%',
+                        height: '6px',
+                        background: 'rgba(71, 85, 105, 0.3)',
+                        borderRadius: '3px',
+                        overflow: 'hidden',
+                      }}
+                    >
+                      <motion.div
+                        initial={{ width: 0 }}
+                        animate={{ width: `${(votes.length / total_nodes) * 100}%` }}
+                        transition={{ duration: 0.5 }}
+                        style={{
+                          height: '100%',
+                          background:
+                            votes.length >= majority
+                              ? 'linear-gradient(90deg, #10b981, #34d399)'
+                              : 'linear-gradient(90deg, #a855f7, #d946ef)',
+                        }}
+                      />
+                    </div>
+                  </div>
+
+                  {/* Voters list */}
+                  {votes.length > 0 && (
+                    <div
+                      style={{
+                        fontSize: '11px',
+                        color: '#10b981',
+                        fontWeight: '600',
+                      }}
+                    >
+                      From: {votes.join(', ')}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </motion.div>
+      )}
+
+      {/* Input KV Store */}
       <div
         style={{
           background: 'rgba(30, 41, 59, 0.8)',
@@ -867,6 +1051,23 @@ const enhancedTableUI = (
                 strokeDasharray="3,3"
               />
 
+              {/* NEW: Vote requests (candidate asking for votes) */}
+              {voteRequests.map((req) => (
+                <motion.line
+                  key={req.id}
+                  x1={nodeCoords[req.from].x}
+                  y1={nodeCoords[req.from].y}
+                  x2={nodeCoords[req.to].x}
+                  y2={nodeCoords[req.to].y}
+                  stroke="#f59e0b"
+                  strokeWidth="2"
+                  strokeDasharray="5,5"
+                  initial={{ pathLength: 0, opacity: 0.8 }}
+                  animate={{ pathLength: 1, opacity: 1 }}
+                  transition={{ duration: 1 }}
+                />
+              ))}
+
               {/* Heartbeats */}
               {activeMessage?.type === 'heartbeat' &&
                 leaderId &&
@@ -899,8 +1100,8 @@ const enhancedTableUI = (
                 />
               )}
 
-              {/* Peer responses */}
-              {activeMessage?.type === 'peer_response' &&
+              {/* Vote responses (voters responding to candidate) */}
+              {activeMessage?.type === 'vote_response' &&
                 nodeCoords[activeMessage.from] &&
                 nodeCoords[activeMessage.to] && (
                   <motion.line
@@ -917,22 +1118,57 @@ const enhancedTableUI = (
                   />
                 )}
 
+              {/* NEW: Election won animation */}
+              {showElectionAnimation && electionWinner && (
+                <motion.circle
+                  cx={nodeCoords[electionWinner].x}
+                  cy={nodeCoords[electionWinner].y}
+                  r={50}
+                  fill="none"
+                  stroke="#10b981"
+                  strokeWidth="3"
+                  initial={{ r: 50, opacity: 1 }}
+                  animate={{ r: 130, opacity: 0 }}
+                  transition={{ duration: 1.5 }}
+                />
+              )}
+
               {/* Nodes A, B, C */}
               {['A', 'B', 'C'].map((nodeId) => {
-                const isLeader = leaderId === nodeId;
-                const color = isLeader ? nodeColors.leader : nodeColors.follower;
+                const state = getNodeState(nodeId);
+                const color =
+                  state === 'LEADER'
+                    ? nodeColors.leader
+                    : state === 'CANDIDATE'
+                      ? nodeColors.candidate
+                      : nodeColors.follower;
                 const coords = nodeCoords[nodeId];
 
                 return (
                   <g key={`node-${nodeId}`}>
-                    <circle
+                    <motion.circle
                       cx={coords.x}
                       cy={coords.y}
                       r={50}
                       fill={color.gradient}
-                      style={{
-                        filter: `drop-shadow(0 4px 12px ${color.shadow})`,
-                      }}
+                      animate={
+                        state === 'CANDIDATE'
+                          ? {
+                              filter: [
+                                `drop-shadow(0 4px 12px ${color.shadow})`,
+                                `drop-shadow(0 4px 20px ${color.shadow})`,
+                                `drop-shadow(0 4px 12px ${color.shadow})`,
+                              ],
+                            }
+                          : {
+                              filter: `drop-shadow(0 4px 12px ${color.shadow})`,
+                            }
+                      }
+                      transition={
+                        state === 'CANDIDATE'
+                          ? { duration: 1, repeat: Infinity }
+                          : { duration: 0 }
+                      }
                     />
                     <text
                       x={coords.x}
@@ -952,7 +1188,7 @@ const enhancedTableUI = (
                       fontSize="11"
                       fontWeight="600"
                     >
-                      {getNodeState(nodeId)}
+                      {state}
                     </text>
                   </g>
                 );
@@ -1032,7 +1268,12 @@ const enhancedTableUI = (
                   fontWeight: '700',
                   marginTop: 0,
                   marginBottom: '1rem',
-                  color: leaderId === nodeId ? '#fed7aa' : '#bfdbfe',
+                  color:
+                    getNodeState(nodeId) === 'LEADER'
+                      ? '#fed7aa'
+                      : getNodeState(nodeId) === 'CANDIDATE'
+                        ? '#d946ef'
+                        : '#bfdbfe',
                 }}
               >
                 Node {nodeId} Log
@@ -1086,7 +1327,13 @@ const enhancedTableUI = (
                         {log.value || 'Empty entry'}
                       </span>
                       {log.committed && (
-                        <span style={{ fontSize: '9px', marginLeft: '0.5rem', whiteSpace: 'nowrap' }}>
+                        <span
+                          style={{
+                            fontSize: '9px',
+                            marginLeft: '0.5rem',
+                            whiteSpace: 'nowrap',
+                          }}
+                        >
                           ✓
                         </span>
                       )}
@@ -1099,7 +1346,7 @@ const enhancedTableUI = (
         </div>
       </div>
 
-      {/* Committed KV Store (State Machine) - 3 columns: Key, Field, Value */}
+      {/* Committed KV Store */}
       {enhancedTableUI}
 
       {/* Legend */}
@@ -1145,6 +1392,24 @@ const enhancedTableUI = (
               width: '12px',
               height: '12px',
               borderRadius: '50%',
+              background: 'linear-gradient(135deg, #a855f7, #f59e0b)',
+            }}
+          />
+          Candidate (Running for election)
+        </div>
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.75rem',
+            color: '#cbd5e1',
+          }}
+        >
+          <div
+            style={{
+              width: '12px',
+              height: '12px',
+              borderRadius: '50%',
               background: 'linear-gradient(135deg, #3b82f6, #06b6d4)',
             }}
           />
@@ -1169,8 +1434,19 @@ const enhancedTableUI = (
             color: '#cbd5e1',
           }}
         >
+          <div style={{ width: '12px', height: '2px', background: '#f59e0b' }} />
+          Vote Request (Orange)
+        </div>
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.75rem',
+            color: '#cbd5e1',
+          }}
+        >
           <div style={{ width: '12px', height: '2px', background: '#10b981' }} />
-          Peer Response (Green)
+          Vote Response (Green)
         </div>
       </div>
 

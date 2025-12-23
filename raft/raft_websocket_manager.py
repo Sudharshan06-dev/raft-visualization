@@ -122,6 +122,45 @@ class WebSocketManager:
         }
         await self._broadcast_now(message)
     
+    async def broadcast_vote_request(self, node_id: int, current_term: int, last_log_index: int, last_log_term: int):
+        print(f"broadcast vote request EXECUTING {node_id}")
+        message = {
+            "type": "vote_request",
+            "node_id": str(node_id),
+            "current_term": current_term,
+            "last_log_index": last_log_index,
+            "last_log_term": last_log_term,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        await self._broadcast_now(message)
+    
+    async def broadcast_vote_response(self, node_id: int, voted_for: int, current_term: int, last_log_index: int, last_log_term: int):
+        print(f"broadcast vote response EXECUTING {node_id}")
+        message = {
+            "type": "vote_response",
+            "node_id": str(node_id),
+            "voted_for": voted_for,
+            "current_term": current_term,
+            "last_log_index": last_log_index,
+            "last_log_term": last_log_term,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        await self._broadcast_now(message)
+    
+    async def broadcast_election_result(self, node_id: int, election_result: bool, voted_by: List[int], current_term: int, last_log_index: int, last_log_term: int):
+        print(f"broadcast election result {node_id}")
+        message = {
+            "type": "election_result",
+            "node_id": str(node_id),
+            "election_result": election_result,
+            "voted_by": voted_by,
+            "current_term": current_term,
+            "last_log_index": last_log_index,
+            "last_log_term": last_log_term,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        await self._broadcast_now(message)
+    
     async def broadcast_entries_committed(
         self,
         node_id: str,
