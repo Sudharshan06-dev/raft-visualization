@@ -22,10 +22,6 @@ class Raft(IRaftActions):
     For now methods are placeholders; the structure is stored on
     `self.raft_terms` and exposed to tests via RPC methods.
     """
-    
-    MIN_DELAY = 0.3 # 300ms is the minimum time to be added to the election timer
-    MAX_DELAY = 0.5 # 500ms is the maximum time to be added to the election timer
-
     def __init__(self, node_id, peers_config=None, logs_file_path="raft_logs.jsonl", state_machine_applier=None):
         # initialize raft structure with sensible defaults
         self._killed = False
@@ -92,10 +88,7 @@ class Raft(IRaftActions):
         Signals the ticker to stop sleeping/waiting immediately
         and restart the countdown.
         """
-        print(f"[Node {self.raft_terms.id}] Resetting timer NOW.")
-        
         # Setting the event interrupts the 'wait' call in the ticker() loop
-        
         if self.raft_terms.state != RaftState.leader:
             self.election_timer_event.set()
     
@@ -129,13 +122,11 @@ class Raft(IRaftActions):
             #Check if the leader invokes the health check up
             #If the events occurs then we have to again reset the timer for the election timeout
             if heartbeat_received:
-                print(f"[Node {self.raft_terms.id}] Election timeout received, resetting timer")
                 continue
             
              # ← ADD THIS CHECK: Don't start election if we're leader!
             with self.lock:
                 if self.raft_terms.state == RaftState.leader:
-                    print(f"[Node {self.raft_terms.id}] Leader - skipping election")
                     continue  # ← Skip election, just loop again
             
             # Election timeout fired -> start leader election
@@ -189,12 +180,9 @@ class Raft(IRaftActions):
                 # Rule 3: Persist to disk immediately (required by Raft)
                 self._persist_log_entry(log_entry)
                 
-                #Rule 4: Send the heartbeat to the UI saying that the leader has written the data
-                print(f"[Node {self.raft_terms.id}] Appended log entry at index {log_index}")
+                print(f"[Node {self.raft_terms.id}] Leader appended log entry at index {log_index}: '{log_entry['command'][:50]}...'")
                 
             try:
-                print(f"[Node {self.raft_terms.id}] Leader Broadcasting to the UI...")
-                
                 # ← FIX: Get the loop from WebSocketManager (which has the running loop)
                 loop = self.ws_manager.event_loop
                 
@@ -215,7 +203,6 @@ class Raft(IRaftActions):
                     ),
                     loop,
                 )
-                print(f"[Node {self.raft_terms.id}] Coroutine scheduled on event loop")
                 
                 # Rule 4: Return to client
                 # Client can:
@@ -380,8 +367,6 @@ class Raft(IRaftActions):
             peers = dict(self.raft_terms.peers)
         
         try:
-            print(f"[Node {self.raft_terms.id}] Broadcasting leader election vote request to UI...")
-            
             # ← FIX: Get the loop from WebSocketManager (which has the running loop)
             loop = self.ws_manager.event_loop
             
@@ -403,7 +388,6 @@ class Raft(IRaftActions):
                 ),
                 loop,
             )
-            print(f"[Node {self.raft_terms.id}] Coroutine scheduled on event loop for leader election")
             
         except Exception as e:
             print(f"[Node {self.raft_terms.id}] WebSocket broadcast error: {e}")
@@ -463,7 +447,6 @@ class Raft(IRaftActions):
                     ),
                     loop,
                 )
-                print(f"[Node {self.raft_terms.id}] Broadcast: Election result { self.raft_terms.commit_index}")
         except Exception as e:
             print(f"[Node {self.raft_terms.id}] Error broadcasting: {e}")
             
@@ -520,9 +503,9 @@ class Raft(IRaftActions):
                 self.raft_terms.voted_for = vote_arguments.candidate_id
                 self._persist_state()  # Persist vote before responding
                 self.reset_election_timer()  # Reset our own election timeout
-                print(f"[Node {self.raft_terms.id}] GRANTED vote to Node {vote_arguments.candidate_id}")
+                print(f"[Node {self.raft_terms.id}] GRANTED vote to Node {vote_arguments.candidate_id} for term {vote_arguments.current_term}")
                 
-                # Broadcast vote response from follwers to leader
+                # Broadcast vote response from followers to leader
                 try:
                     loop = self.ws_manager.event_loop
                     if loop and loop.is_running():
@@ -536,15 +519,14 @@ class Raft(IRaftActions):
                             ),
                             loop,
                         )
-                        print(f"[Node {self.raft_terms.id}] Broadcast voted for  {vote_arguments.candidate_id}")
                 except Exception as e:
                     print(f"[Node {self.raft_terms.id}] Error broadcasting: {e}")
                     
                 return True
             else:
-                print(f"[Node {self.raft_terms.id}] REJECTED vote (can_vote={can_vote}, log_current={log_is_current})")
+                print(f"[Node {self.raft_terms.id}] REJECTED vote from Node {vote_arguments.candidate_id} (can_vote={can_vote}, log_current={log_is_current})")
                 
-                # Broadcast vote response from follwers to leader
+                # Broadcast vote response from followers to leader
                 try:
                     loop = self.ws_manager.event_loop
                     if loop and loop.is_running():
@@ -558,7 +540,6 @@ class Raft(IRaftActions):
                             ),
                             loop,
                         )
-                        print(f"[Node {self.raft_terms.id}] Broadcast: reject vote for { vote_arguments.candidate_id}")
                 except Exception as e:
                     print(f"[Node {self.raft_terms.id}] Error broadcasting: {e}")
                     
@@ -569,8 +550,6 @@ class Raft(IRaftActions):
     # -----------------------------
     
     def _heartbeat_ticker(self):
-        
-        print(f"[Node {self.raft_terms.id}] Heartbeat ticker thread STARTED")  # ← Add this
         
         """
         PHASE 2: LOG REPLICATION - Heartbeat loop (leader only)
@@ -589,7 +568,6 @@ class Raft(IRaftActions):
                 is_leader = (self.raft_terms.state == RaftState.leader)
             
             if is_leader:
-                print(f"[Node {self.raft_terms.id}] Sending heartbeats...") 
                 self.send_health_checks()
             
             # Wait 3 seconds before next heartbeat
@@ -620,16 +598,12 @@ class Raft(IRaftActions):
             if self.raft_terms.state != RaftState.leader:
                 return
             
-            print(f"SEND HEALTH CHECK TO PEERS ARRIVED {self.raft_terms.state}")
-            
             # ADDED: Collect followers list for WebSocket broadcast
             followers = [peer_id for peer_id in self.raft_terms.peers.keys() if peer_id != self.raft_terms.id]
             
             peers = dict(self.raft_terms.peers)
         
         try:
-            print(f"[Node {self.raft_terms.id}] Broadcasting heartbeat to UI...")
-            
             # ← FIX: Get the loop from WebSocketManager (which has the running loop)
             loop = self.ws_manager.event_loop
             
@@ -653,7 +627,6 @@ class Raft(IRaftActions):
                 ),
                 loop,
             )
-            print(f"[Node {self.raft_terms.id}] Coroutine scheduled on event loop")
             
         except Exception as e:
             print(f"[Node {self.raft_terms.id}] WebSocket broadcast error: {e}")
@@ -719,7 +692,6 @@ class Raft(IRaftActions):
                     return {"success": False, "term": self.raft_terms.current_term}
             
             # Rule 4: Append new entries (if any)
-            print(f'CHECKING HERE BEFORE RULE 4', health_check_arguments.entries)
             if health_check_arguments.entries:
                 # Delete any conflicting entries and append new ones
                 insert_index = health_check_arguments.prev_log_index + 1
@@ -764,10 +736,9 @@ class Raft(IRaftActions):
                     self.raft_terms.last_log_index = len(self.raft_terms.logs) - 1
                     self.raft_terms.last_log_term = self.raft_terms.logs[-1]["term"]
                 
-                print(f"[Node {self.raft_terms.id}] Appended {len(health_check_arguments.entries)} entries")
+                print(f"[Node {self.raft_terms.id}] Follower appended {len(health_check_arguments.entries)} entries (now have {len(self.raft_terms.logs)} total)")
             
             # Rule 5: Update commitIndex
-            print(f'RULE 5 CHECK HERE {self.raft_terms.id}  - {health_check_arguments.leader_commit} {self.raft_terms.commit_index}')
             if health_check_arguments.leader_commit > self.raft_terms.commit_index:
                 old_commit = self.raft_terms.commit_index
                 self.raft_terms.commit_index = min(
@@ -788,7 +759,6 @@ class Raft(IRaftActions):
                             ),
                             loop,
                         )
-                        print(f"[Node {self.raft_terms.id}] Broadcast: Entries committed up to index { self.raft_terms.commit_index}")
                 except Exception as e:
                     print(f"[Node {self.raft_terms.id}] Error broadcasting: {e}")
                     
@@ -807,7 +777,7 @@ class Raft(IRaftActions):
             self.raft_terms.last_applied += 1
             log_entry = self.raft_terms.logs[self.raft_terms.last_applied]
             
-            print(f"[Node {self.raft_terms.id}] Applying log entry {self.raft_terms.last_applied} to state machine")
+            print(f"[Node {self.raft_terms.id}] Applying entry {self.raft_terms.last_applied} to state machine: '{log_entry['command'][:50]}...'")
             
             # Apply to state machine using the applier
             if self.state_machine_applier:
@@ -827,11 +797,9 @@ class Raft(IRaftActions):
                                 ),
                                 loop,
                             )
-                            print(f"[Node {self.raft_terms.id}] Broadcast: KV store updated")
                     except Exception as e:
                         print(f"[Node {self.raft_terms.id}] Error broadcasting: {e}")
                     
-                    print(f"[Node {self.raft_terms.id}] State machine apply result: {result}")
                 except Exception as e:
                     print(f"[Node {self.raft_terms.id}] Error applying to state machine: {e}")
     
@@ -839,8 +807,6 @@ class Raft(IRaftActions):
         """Send AppendEntries RPC to a single peer (NO CALLBACK)"""
         conn = None
         try:
-            
-            print(f"HEALTH CHECK IS CALLED {peer_id}")
             
             with self.lock:
                 # Prepare entries to send (from nextIndex[peer] onwards)
@@ -867,8 +833,6 @@ class Raft(IRaftActions):
                     leader_commit=self.raft_terms.commit_index
                 )
             
-            print(f"[Node {self.raft_terms.id}] Sending health checks to Node {peer_id} {health_check_args}")
-            
             conn = rpyc.connect(
                 peer_value["host"],
                 peer_value["port"],
@@ -876,8 +840,6 @@ class Raft(IRaftActions):
             )
     
             result = conn.root.exposed_send_health_check_request(health_check_args)
-            
-            print(f"[Node {self.raft_terms.id}] RPC to Node {peer_id}: {result}")
             
             # after getting `result`:
             try:
@@ -894,7 +856,6 @@ class Raft(IRaftActions):
                         ),
                         loop,
                     )
-                print(f"[Node {self.raft_terms.id}] Broadcast successful for {peer_id}")
             except Exception as e:
                 print(f"[Node {self.raft_terms.id}] WebSocket peer response broadcast error: {e}")
             
@@ -914,7 +875,7 @@ class Raft(IRaftActions):
                     # Decrement nextIndex[peer] and retry next time
                     if self.next_index[peer_id] > 0:
                         self.next_index[peer_id] -= 1
-                        print(f"[Node {self.raft_terms.id}] Log mismatch with Node {peer_id}, decrement nextIndex to {self.next_index[peer_id]}")
+                        print(f"[Node {self.raft_terms.id}] Log mismatch with Node {peer_id}, decrementing nextIndex to {self.next_index[peer_id]}")
 
                     return
 
@@ -926,7 +887,7 @@ class Raft(IRaftActions):
                     self.match_index[peer_id] = new_match_index
                     self.next_index[peer_id] = new_match_index + 1
                 
-                    print(f"[Node {self.raft_terms.id}] Node {peer_id} now has logs up to index {new_match_index}")
+                    print(f"[Node {self.raft_terms.id}] Node {peer_id} replicated entries up to index {new_match_index}")
                 
                     # Check if we can advance commitIndex
                     # commitIndex = highest index replicated on majority
@@ -935,7 +896,7 @@ class Raft(IRaftActions):
                 else:
                     # Just a heartbeat, no new entries sent
                     # Don't update matchIndex/nextIndex
-                    print(f"[Node {self.raft_terms.id}] Heartbeat to Node {peer_id} successful (no new entries)")
+                    pass
             
         except Exception as e:
             # Peer is down or unreachable - do nothing
@@ -1029,11 +990,10 @@ class Raft(IRaftActions):
                             ),
                             loop,
                         )
-                        print(f"[Node {self.raft_terms.id}] Broadcast: Entries committed up to index {index}")
                 except Exception as e:
                     print(f"[Node {self.raft_terms.id}] Error broadcasting: {e}")
                     
-                print(f"[Node {self.raft_terms.id}] Advanced commitIndex: {old_commit} -> {index}")
+                print(f"[Node {self.raft_terms.id}] Advanced commitIndex: {old_commit} -> {index} (replicated on {replicated_count}/{total_servers} servers)")
             
                 # Apply newly committed entries
                 self._apply_committed_entries()
