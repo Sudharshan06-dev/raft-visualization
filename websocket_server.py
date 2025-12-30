@@ -90,9 +90,7 @@ async def write_kv_store(kv_item: KvItem):
         # Get current timestamp (microseconds)
         timestamp = int(time.time() * 1_000_000)
         print(f"Timestamp: {timestamp}")
-
-        # Create KV client - connects to cluster
-        # Client will automatically find the leader
+        
         client = KVClient(CLUSTER_CONFIG)
         
         # Call set on the cluster (will be routed to leader)
@@ -114,7 +112,8 @@ async def write_kv_store(kv_item: KvItem):
             "field": kv_item.field,
             "value": kv_item.value,
             "timestamp": timestamp,
-            "result": result if result else "Entry appended to leader's log"
+            "log_index": result['index'] if result['success'] else None,
+            "term": result['term'] if result['success'] else None,
         }
 
     except ConnectionError as e:
@@ -144,6 +143,117 @@ async def write_kv_store(kv_item: KvItem):
             "exception_type": type(e).__name__
         }, 500
 
+@app.get("/kv-store")
+async def kv_store(key: str, field: str):
+    try:
+        print(f"\n{'='*60}")
+        print(f"KV Store Get Request")
+
+        # Get current timestamp (microseconds)
+        timestamp = int(time.time() * 1_000_000)
+        print(f"Timestamp: {timestamp}")
+        
+        client = KVClient(CLUSTER_CONFIG)
+        
+        # Call set on the cluster (will be routed to leader)
+        # This initiates log replication across the cluster
+        result = client.get(
+            key=str(key),
+            field=str(field),
+            timestamp=timestamp,
+        )
+
+        print(f"KVClient.get() returned: {result}")
+        
+        return {
+            "success": True,
+            "message": "Data retrived successfully",
+            "value": result['value'] if result["success"] else "NOT FOUND"
+        }
+
+    except ConnectionError as e:
+        print(f"Connection Error: {e}")
+        return {
+            "success": False,
+            "error": "CONNECTION_ERROR",
+            "message": f"Failed to connect to cluster: {str(e)}",
+            "details": "Make sure start_cluster.py has started the RAFT nodes"
+        }, 503
+
+    except TimeoutError as e:
+        print(f"Timeout Error: {e}")
+        return {
+            "success": False,
+            "error": "TIMEOUT_ERROR",
+            "message": f"Cluster operation timed out: {str(e)}",
+            "details": "Leader may be unavailable or nodes are slow to respond"
+        }, 504
+
+    except Exception as e:
+        print(f"Unexpected Error: {type(e).__name__}: {e}")
+        return {
+            "success": False,
+            "error": "INTERNAL_ERROR",
+            "message": f"Error while reading to KV store: {str(e)}",
+            "exception_type": type(e).__name__
+        }, 500
+
+@app.delete("/kv-store")
+async def delete_kv_store(key: str, field: str):
+    try:
+        print(f"\n{'='*60}")
+        print(f"KV Store Get Request")
+
+        # Get current timestamp (microseconds)
+        timestamp = int(time.time() * 1_000_000)
+        print(f"Timestamp: {timestamp}")
+        
+        client = KVClient(CLUSTER_CONFIG)
+        
+        # Call set on the cluster (will be routed to leader)
+        # This initiates log replication across the cluster
+        result = client.delete(
+            key=str(key),
+            field=str(field),
+            timestamp=timestamp,
+        )
+
+        print(f"KVClient.delete() returned: {result}")
+        
+        return {
+            "success": True,
+            "key": str(key),
+            "field": str(field),
+            "result": "Entry appended to leader's log"
+        }
+
+    except ConnectionError as e:
+        print(f"Connection Error: {e}")
+        return {
+            "success": False,
+            "error": "CONNECTION_ERROR",
+            "message": f"Failed to connect to cluster: {str(e)}",
+            "details": "Make sure start_cluster.py has started the RAFT nodes"
+        }, 503
+
+    except TimeoutError as e:
+        print(f"Timeout Error: {e}")
+        return {
+            "success": False,
+            "error": "TIMEOUT_ERROR",
+            "message": f"Cluster operation timed out: {str(e)}",
+            "details": "Leader may be unavailable or nodes are slow to respond"
+        }, 504
+
+    except Exception as e:
+        print(f"Unexpected Error: {type(e).__name__}: {e}")
+        return {
+            "success": False,
+            "error": "INTERNAL_ERROR",
+            "message": f"Error while deleting KV field: {str(e)}",
+            "exception_type": type(e).__name__
+        }, 500
+        
 @app.get("/health")
 async def health():
     """Health check endpoint"""

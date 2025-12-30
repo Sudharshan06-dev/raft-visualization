@@ -61,6 +61,7 @@ class WebSocketManager:
         except Exception:
             return "unknown"
 
+    #ON CLIENT STARTUP WE BROADCAST ALL THE ENTRIES TO LOAD THE DATA TO THE MEMORY AND SYNC IT WITH UI
     async def on_client_connect(self):
         """
         Called when a browser connects via WebSocket.
@@ -171,8 +172,8 @@ class WebSocketManager:
             "leader_id": str(leader_id),
             "peer_id": str(peer_id),
             "success": bool(success),
+            "term": result['term'] if result['success'] else None,
             "timestamp": datetime.utcnow().isoformat(),
-            "result": result,
         }
         await self._broadcast_now(message)
 

@@ -4,3 +4,4 @@ raft-venv
 *.log
 *.json
 *.jsonl
+test_load
