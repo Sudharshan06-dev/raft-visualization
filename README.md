@@ -4,26 +4,6 @@
 
 ---
 
-## 🎯 Project Status: ✅ COMPLETE & PRODUCTION-READY
-
-This project is a **fully functional, tested, and documented** implementation of RAFT consensus with a distributed KV store and real-time dashboard.
-
-**Test Results: 10/10 PASSING ✅**
-- Normal Operation ✅
-- Leader Crash & Re-election ✅
-- Follower Crash Resilience ✅
-- Split Brain Prevention ✅
-- Commit Index Advancement ✅
-- Log Replication ✅
-- State Machine Consistency ✅
-- Term Monotonicity ✅
-- Commit Index Invariant ✅
-- Leader Stability ✅
-
-**Key Achievement:** All RAFT invariants verified under failure scenarios. 100% test pass rate.
-
----
-
 ## 🏗️ System Architecture
 
 ```
@@ -86,12 +66,14 @@ This project is a **fully functional, tested, and documented** implementation of
 ### **Prerequisites**
 ```bash
 Python 3.8+
+python3 -m venv raft-venv
+source raft-venv/bin/activate
 pip install -r requirements.txt
 ```
 
 ### **Start 3-Node Cluster**
 ```bash
-python3 start_cluster_test_inmem_raft_reslience.py
+python3 start_cluster.py
 ```
 
 **Output:**
@@ -123,13 +105,11 @@ RAFT Cluster Startup - Phase 2: Begin Leader Election
 ✨ [CLUSTER] Node B elected as LEADER in term 1
 ```
 
-### **Open Dashboard**
+### **Start the react visualization dashboard**
 ```bash
-# In another terminal
-cd frontend
+# In terminal 2
+cd client/raft-visualization
 npm run dev
-
-# Open http://localhost:3000
 ```
 
 ---
@@ -156,7 +136,7 @@ result = client.set(
     timestamp=1000,
     ttl=None
 )
-# ✅ Data replicated to all nodes
+# Data replicated to all nodes
 ```
 
 ### **Read Data**
@@ -436,10 +416,10 @@ Based on testing:
 ### **1. 3-Node Cluster (Not 5)**
 ```
 Why 3 nodes?
-✅ Minimal quorum for tolerance (2 out of 3)
-✅ Fast replication (less network traffic)
-✅ Easy to test and understand
-✅ Represents majority of real deployments
+ * Minimal quorum for tolerance (2 out of 3)
+ * Fast replication (less network traffic)
+ * Easy to test and understand
+ * Represents majority of real deployments
 
 Real use: 3-5 nodes typical for production
          5-7 for high availability
@@ -449,10 +429,10 @@ Real use: 3-5 nodes typical for production
 ### **2. Persistent Logs (Disk Storage)**
 ```
 Why persistent?
-✅ Logs survive node restarts
-✅ New nodes can catch up via logs
-✅ Enables snapshot/recovery
-✅ Production requirement
+ * Logs survive node restarts
+ * New nodes can catch up via logs
+ * Enables snapshot/recovery
+ * Production requirement
 
 Implementation: JSONL format (one entry per line)
                Append-only (never modify)
@@ -462,10 +442,10 @@ Implementation: JSONL format (one entry per line)
 ### **3. ThreadPoolExecutor for Parallelism**
 ```
 Why parallel RPC?
-✅ Send to 3 nodes in parallel: 100ms
+ * Send to 3 nodes in parallel: 100ms
    vs sequential: 300ms
-✅ Real-world network has latency
-✅ Parallelism is critical
+ * Real-world network has latency
+ * Parallelism is critical
 
 Implementation: 3 worker threads
                Dynamic thread pool
@@ -475,10 +455,10 @@ Implementation: 3 worker threads
 ### **4. WebSocket for Real-Time UI**
 ```
 Why WebSocket?
-✅ Server can push updates (not just poll)
-✅ Low latency visualization
-✅ Can show animation of RPC messages
-✅ Real-time metrics
+ * Server can push updates (not just poll)
+ * Low latency visualization
+ * Can show animation of RPC messages
+ * Real-time metrics
 
 Implementation: FastAPI + WebSocket
                Async push updates
@@ -492,13 +472,14 @@ Implementation: FastAPI + WebSocket
 - **RAFT Paper**: [In Search of an Understandable Consensus Algorithm](https://raft.github.io/raft.pdf)
 - **Raft Visualization**: [Interactive RAFT Visualization](http://thesecretlivesofdata.com/raft/)
 - **Original Research**: [Diego Ongaro's Thesis](https://github.com/ongardie/raft.github.io)
+- **MIT 6.824: Distributed Systems** (YouTube Playlist): [Watch the course](https://www.youtube.com/watch?v=cQP8WApzIQQ&list=PLrw6a1wE39_tb2fErI4-WkMbsvGQk9_UB)
 
 ---
 
 ## 🎥 Documentation
 
-- **Blog Post**: Comprehensive guide on implementing RAFT (coming soon)
-- **Video Demo**: 3-5 minute walkthrough of the system (coming soon)
+- **Blog Post**: [Devto Blog Post](https://dev.to/sudharshan06/building-a-production-grade-raft-consensus-implementation-a-deep-dive-into-distributed-systems)
+- **Video Demo**: [Video Walkthrough of my implementation](https://drive.google.com/file/d/189tMrzFhBbt4q-qaBMdpcNLnV4wxili5/view?usp=sharing)
 ---
 
 ## ⚠️ Known Limitations (Future Work)
@@ -514,20 +495,6 @@ Implementation: FastAPI + WebSocket
 - 🔄 Index Management (faster scans)
 - 🔄 Write-Ahead Log (faster recovery)
 - 🔄 Compression (reduce disk space)
-
----
-
-## 🎯 Next Steps
-
-1. **Read the Blog** (Coming soon)
-   - Deep dive into each component
-   - Challenges and solutions
-   - Design decisions explained
-
-2. **Watch the Video** (Coming soon)
-   - See the system in action
-   - Node crash recovery
-   - Real-time visualization
 
 ---
 
@@ -556,5 +523,4 @@ MIT License - Feel free to use for learning or building upon
 
 ---
 
-*Last Updated: December 2025*
-*Status: Production-Ready*
+*Last Updated: Jan 2026*
